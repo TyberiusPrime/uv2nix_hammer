@@ -1,4 +1,7 @@
 import sys
+import urllib3
+import json
+import argparse
 import toml
 import re
 from pathlib import Path
@@ -70,7 +73,28 @@ def uv_lock(folder):
 
 
 def verify_target_on_pypi(pkg, version):
-    pass  # TODO
+    from packaging.version import Version
+
+    url = f"https://pypi.org/pypi/{pkg}/json"
+    resp = urllib3.request("GET", url)
+    json = resp.json()
+    if json.get('message') == 'Not Found':
+        raise ValueError("package not on pypi")
+    if version is None:
+        releases = json["releases"]
+        # sort with Version aware sort?
+        version = sorted(releases.keys(), reverse=True, key=Version)[0]
+    else:
+        if not version in json["releases"]:
+            print(f"No release {version} for {pkg} not found on pypi")
+            sys.exit(1)
+
+    had_src = False
+    for value in json["releases"][version]:
+        if value.get("url").endswith(".tar.gz"):
+            had_src = True
+            break
+    return version, had_src
 
 
 def gitify(folder):
@@ -90,7 +114,7 @@ def attempt_build(project_folder):
         cwd=project_folder,
     )
     subprocess.run(
-        ["nix", "build"],
+        ["nix", "build", "--keep-going"],
         cwd=project_folder,
         stderr=(project_folder / f"run_{attempt_no}.log").open("w"),
     )
@@ -113,8 +137,15 @@ def load_failures(project_folder, run_no):
     return {drv: get_nix_log(drv) for drv in failed_drvs}
 
 
-def load_existing_rules(overrides_folder, pkg, pkg_version):
-    path = overrides_folder / "overrides" / pkg / pkg_version / "rules.toml"
+def load_existing_rules(overrides_folder, pkg, pkg_version, is_wheel):
+    path = (
+        overrides_folder
+        / "overrides"
+        / pkg
+        / pkg_version
+        / f"rules_{'wheel' if is_wheel else 'src'}.toml"
+    )
+
     if path.exists():
         return toml.load(path)["rules"]
     else:
@@ -134,16 +165,29 @@ def write_combined_rules(path, rules_to_combine):
     """)
 
 
+def check_for_wheel_build(drv):
+    derivation = json.loads(
+        subprocess.check_output(["nix", "show-derivation", drv], text=True)
+    )[drv]
+    env = derivation["env"]
+    src = env["src"]
+    return src.endswith(".whl")
+
+
 def apply_rules(project_folder, overrides_folder, failures):
     print("apply rules", len(failures))
     any_applied = False
     rules_so_far = {}
     for drv, log in failures.items():
-        print(drv)
+        print(drv, len(log))
         nix_name = drv.split("/")[-1]
-        pkg_tuple = tuple(nix_name[:-4].rsplit("-")[-2:])
-        rules_here = load_existing_rules(overrides_folder, *pkg_tuple)
-        print(pkg_tuple)
+        parts = nix_name[:-4].rsplit("-")
+        version = parts[-1]
+        pkg = "-".join(parts[2:-1])
+        pkg_tuple = (pkg, version)
+        is_wheel = check_for_wheel_build(drv)
+        rules_here = load_existing_rules(overrides_folder, *pkg_tuple, is_wheel)
+        print(pkg_tuple, 'is_wheel',is_wheel)
         for rule_name in dir(rules):
             rule = getattr(rules, rule_name)
             if isinstance(rule, type):
@@ -153,37 +197,86 @@ def apply_rules(project_folder, overrides_folder, failures):
                         print("\t Hit!")
                         rules_here.append(rule_name)
                         any_applied = True
-        rules_so_far[pkg_tuple] = rules_here
+        rules_so_far[pkg_tuple, is_wheel] = rules_here
 
     if any_applied:
-        for (pkg, version), rules_here in rules_so_far.items():
-            path = overrides_folder / "overrides" / pkg / version / "rules.toml"
+        for ((pkg, version), is_wheel), rules_here in rules_so_far.items():
+            path = (
+                overrides_folder
+                / "overrides"
+                / pkg
+                / version
+                / f"rules_{'wheel' if is_wheel else 'src'}.toml"
+            )
+            path.parent.mkdir(exist_ok=True, parents=True)
             toml.dump({"rules": rules_here}, path.open("w"))
             write_combined_rules(path.with_name("default.nix"), rules_here)
+    subprocess.check_call(["git", "add", "."], cwd=overrides_folder)
     return any_applied
 
 
-def clear_existing_overrides(overrides_folder, target_pkg, target_pkg_version):
+def clear_existing_overrides(
+    overrides_folder, target_pkg, target_pkg_version, sdist_or_wheel
+):
+    """Note that sdist_or_wheel is for this package and derived from pypi
+    if --sdist is not set. Package might not have a wheel dist.
+    """
+    is_wheel = sdist_or_wheel == "wheel"
     default_nix = (
         overrides_folder / "overrides" / target_pkg / target_pkg_version / "default.nix"
     )
     default_nix.parent.mkdir(exist_ok=True, parents=True)
     default_nix.write_text("""{...}: old: {}""")
     rules_toml = (
-        overrides_folder / "overrides" / target_pkg / target_pkg_version / "rules.toml"
+        overrides_folder
+        / "overrides"
+        / target_pkg
+        / target_pkg_version
+        / f"rules_{'wheel' if is_wheel else 'src'}.toml"
     )
-    rules_toml.write_text("""rules = []""")
+    if rules_toml.exists():
+        rules_toml.unlink()
+
+    rules_toml.write_text(toml.dumps({"rules": []}))
+
+
+def get_parser():
+    p = argparse.ArgumentParser(
+        prog="uv2nix_hammer",
+        description="Autogenerate overrides for uv2nix usage",
+        epilog="Because the existance of nails implies the existance of at least one hammer",
+    )
+    p.add_argument(
+        "target_pkg",
+        type=str,
+        help="The package to build (from pypi)",
+    )
+    p.add_argument(
+        "target_pkg_version",
+        type=str,
+        help='Version of the package to build. Optional, defaults to "newest"',
+        nargs="?",
+    )
+    p.add_argument(
+        "-s",
+        "--sdist",
+        action="store_true",
+        help="Whether to build from sdist or wheel. Defaults to wheel",
+    )
+    return p
 
 
 def main():
-    target_pkg = "mxp"
-    target_pkg_version = "0.3"
-    verify_target_on_pypi(target_pkg, target_pkg_version)
+    args = get_parser().parse_args()
+    target_pkg = args.target_pkg
+    target_pkg_version = args.target_pkg_version
+    target_pkg_version, had_src = verify_target_on_pypi(target_pkg, target_pkg_version)
+    sdist_or_wheel = "sdist" if args.sdist else "wheel"  # the one we put into flake.nix
 
     overrides_source = "https://github.com/TyberiusPrime/uv2nix_hammer_overrides"
     uv2nix = "github:/adisbladis/uv2nix"
 
-    target_folder = Path("hammer_build")
+    target_folder = Path(f"hammer_build_{target_pkg}_{target_pkg_version}")
     target_folder.mkdir(exist_ok=True)
     project_folder = target_folder / "build"
     overrides_folder = target_folder / "overrides"
@@ -205,12 +298,22 @@ def main():
     if not (project_folder / "uv.lock").exists():
         uv_lock(project_folder)
     # if not (project_folder / "flake.nix").exists():
-    write_flake_nix(project_folder, uv2nix, overrides_folder)
+    write_flake_nix(project_folder, uv2nix, overrides_folder, sdist_or_wheel)
     gitify(project_folder)
 
     remove_old_logs(project_folder)
 
-    clear_existing_overrides(overrides_folder, target_pkg, target_pkg_version)
+    if sdist_or_wheel == "wheel":
+        clear = "wheel"  # we'll just assume you had a wheel...
+    else:
+        if had_src:
+            clear = "sdist"
+        else:
+            clear = "wheel"
+
+    clear_existing_overrides(overrides_folder, target_pkg, target_pkg_version, clear)
+    if (project_folder / "result").exists():
+        (project_folder / "result").unlink()
 
     max_trials = 10
     success = False
@@ -242,7 +345,15 @@ def main():
             ],
             cwd=overrides_folder,
         )
-        print("We had success building the packages. Check out the (new) overrides in {overrides_folder}")
+        print(
+            f"We had success building the packages. Check out the (commited) overrides in {overrides_folder} using `git diff HEAD~1 HEAD`"
+        )
     else:
-        print("We failed to achive success in build. Read the error logs in {project_folder} and try to extend the rule set?")
+        print(
+            f"We failed to achive success in build. Read the error logs in {project_folder} and try to extend the rule set?"
+        )
+        if max_trials== 0:
+            print("We gave up because the maximum number of trials was reached")
+        else:
+            print("we gave up because we had no further rules")
         sys.exit(1)

@@ -5,7 +5,9 @@ description = "A tool to automatically derive uv2nix compatible overrides by rea
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "packaging>=24.1",
     "toml>=0.10.2",
+    "urllib3",
 ]
 
 [project.scripts]
