@@ -1,0 +1,17 @@
+[project]
+name = "uv2nix-hammer"
+version = "0.1.0"
+description = "A tool to automatically derive uv2nix compatible overrides by reading build errors and applying rules"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "toml>=0.10.2",
+]
+
+[project.scripts]
+uv2nix-hammer = "uv2nix_hammer:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
