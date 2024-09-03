@@ -224,7 +224,7 @@ def write_combined_rules(path, rules_to_combine):
     src_body = nix_format(src_attrset_parts)
     wheel_body = nix_format(wheel_attrset_parts)
     path.write_text(f"""
-        {{{", ".join(function_arguments)}, ...}}: old: if (old.format == "wheel") then {wheel_body} else {src_body}
+        {{{", ".join(function_arguments)}, ...}}: old: if ((old.format or "sdist") == "wheel") then {wheel_body} else {src_body}
     """)
     subprocess.check_call(["nix", "fmt", str(path.absolute())], cwd=path.parent)
 
