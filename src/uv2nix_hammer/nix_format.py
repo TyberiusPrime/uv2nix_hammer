@@ -1,4 +1,6 @@
 import re
+
+
 def nix_identifier(identifier):
     if re.match("^[A-Za-z_][A-Za-z0-9-]*$", identifier):
         return identifier
@@ -16,7 +18,10 @@ def nix_literal(path):
 
 def nix_format(value):
     if isinstance(value, str):
-        return '"' + value.replace('"', '\\"') + '"'
+        if "\n" in value:
+            return "''" + value.replace("''", "'''") + "''"
+        else:
+            return '"' + value.replace('"', '\\"') + '"'
     elif isinstance(value, (int, float)):
         return str(value)
     elif isinstance(value, tuple) and value[0] == "path":

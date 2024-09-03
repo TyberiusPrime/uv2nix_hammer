@@ -1,11 +1,21 @@
 import tarfile
+import logging
 import zipfile
 import toml
 import json
 import subprocess
+from rich.logging import RichHandler
+
+FORMAT = "%(message)s"
+logging.basicConfig(
+    level="NOTSET", format=FORMAT, datefmt="[%X]", handlers=[RichHandler()]
+)
+
+log = logging.getLogger("rich")
+log.info("Hello, World!")
+
 
 def drv_to_pkg_and_version(drv):
-    # print(drv, len(log))
     nix_name = drv.split("/")[-1]
     parts = nix_name[:-4].rsplit("-")
     version = parts[-1]
@@ -46,3 +56,16 @@ def get_src(drv):
     env = derivation["env"]
     src = env["src"]
     return src
+
+
+class RuleOutput:
+
+    def __init__(self, 
+                 build_inputs = [],
+                 arguments = [], src_attrset_parts = {},wheel_attrset_parts = {}):
+        self.build_inputs = build_inputs
+        self.arguments = arguments
+        self.src_attrset_parts = src_attrset_parts
+        self.wheel_attrset_parts = wheel_attrset_parts
+
+

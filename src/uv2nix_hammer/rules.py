@@ -1,79 +1,68 @@
-from .helpers import extract_pyproject_toml_from_archive, get_src
+from .helpers import extract_pyproject_toml_from_archive, get_src, log, RuleOutput
 
 
 class BuildSystems:
     @staticmethod
     def normalize_build_system(bs):
-        if ">" in bs:
-            bs = bs[: bs.index(">")]
-        if "<" in bs:
-            bs = bs[: bs.index("<")]
-        if ";" in bs:
-            bs = bs[: bs.index(";")]
+        for char in ">;<=":
+            if char in bs:
+                bs = bs[: bs.index(char)]
         bs = bs.replace("_", "-")
         return bs.lower()
 
     @classmethod
-    def match(cls, drv, log, opts):
+    def match(cls, drv, drv_log, opts):
         if opts is None:  # no build system yet.
             opts = []
             try:
-                pyproject_toml = extract_pyproject_toml_from_archive(get_src(drv))
-                print(drv)
-                print("\tgot pyproject.toml")
-                opts = list(
-                    set(
-                        [
-                            cls.normalize_build_system(x)
-                            for x in pyproject_toml["build-system"]["requires"]
-                        ]
+                src = get_src(drv)
+                try:
+                    pyproject_toml = extract_pyproject_toml_from_archive(src)
+                    log.debug(f"\tgot pyproject.toml for {drv}")
+                    opts = sorted(
+                        set(
+                            [
+                                cls.normalize_build_system(x)
+                                for x in pyproject_toml["build-system"]["requires"]
+                            ]
+                        )
                     )
-                )
-                print("\t", opts)
+                    log.debug("\tfound build-systems: {opts}")
+                except ValueError:
+                    opts = ["setuptools"]
             except ValueError:
-                opts = ["setuptools"]
-        if "No module named 'setuptools'" in log:
-            opts.append("setuptools")
+                opts = []  # was a wheel
+        if "No module named 'setuptools'" in drv_log:
+            if not "setuptools" in opts:
+                opts.append("setuptools")
+        if "RuntimeError: Running cythonize failed!" in drv_log and "cython" in opts:
+            log.debug("detected failing cython - trying cython_0")
+            opts.remove("cython")
+            opts.append("cython_0")
+            opts = sorted(opts)
         return opts
 
     @staticmethod
     def apply(opts):
-        return (opts, [], {})
+        return RuleOutput(build_inputs=opts)
 
 
 class TomlRequiresPatcher:
     @staticmethod
-    def match(drv, log, opts):
-        return "Missing dependencies:" in log and "setuptools_scm<" in log
+    def match(drv, drv_log, opts):
+        if "Missing dependencies:" in drv_log:
+            start = drv_log[drv_log.find("Missing dependencies:") :]
+            next_line = start[start.find("\n") + 1 :]
+            end = next_line[: next_line.find("\n")]
+            return "<" in next_line or "==" in next_line
 
     @staticmethod
     def apply(opts):
-        return (
-            [],
-            ["helpers"],
-            {
+        return RuleOutput(
+            arguments=["helpers"],
+            src_attrset_parts={
                 "patchPhase": """
                 ${helpers.tomlreplace} pyproject.toml build-system.requires "[]"
         """
             },
         )
-
-
-# class SetuptoolsSCM:
-#     @staticmethod
-#     def match(log):
-#         return "setuptools_scm" in log
-
-#     @staticmethod
-#     def apply():
-#         return (["setuptools"], [], "")
-
-
-# class Mesonpy:
-#     @staticmethod
-#     def match(log):
-#         return "ModuleNotFoundError: No module named 'mesonpy'" in log
-
-#     @staticmethod
-#     def apply():
-#         return (["meson-python"], [], "")
