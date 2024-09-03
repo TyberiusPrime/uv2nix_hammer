@@ -1,3 +1,4 @@
+import logging
 import sys
 import tarfile
 import zipfile
@@ -9,7 +10,20 @@ import re
 from pathlib import Path
 import subprocess
 from . import rules
-from .helpers import get_src
+from .helpers import get_src, drv_to_pkg_and_version
+
+from rich.logging import RichHandler
+import rich.traceback
+
+rich.traceback.install(show_locals=True)
+
+FORMAT = "%(message)s"
+logging.basicConfig(
+    level="NOTSET", format=FORMAT, datefmt="[%X]", handlers=[RichHandler()]
+)
+
+log = logging.getLogger("rich")
+log.info("Hello, World!")
 
 
 def write_pyproject_toml(folder, pkg, pkg_version):
@@ -91,7 +105,7 @@ def verify_target_on_pypi(pkg, version):
         version = sorted(releases.keys(), reverse=True, key=Version)[0]
     else:
         if not version in json["releases"]:
-            print(f"No release {version} for {pkg} not found on pypi")
+            log.error(f"No release {version} for {pkg} not found on pypi")
             sys.exit(1)
 
     had_src = False
@@ -164,32 +178,50 @@ def load_existing_rules(overrides_folder, pkg, pkg_version, is_wheel):
 
 
 def write_combined_rules(path, rules_to_combine):
+    from .nix_format import nix_format, nix_literal
     function_arguments = set()
-    function_body = []
+    pkg_attr_set_parts = {}
     pkg_build_inputs = set()
 
     for rule_name in rules_to_combine.keys():
         rule = getattr(rules, rule_name)
-        build_inputs, args, body = rule.apply(rules_to_combine[rule_name])
+        build_inputs, args, attr_set_parts = rule.apply(rules_to_combine[rule_name])
         if not isinstance(build_inputs, list):
             raise ValueError(
                 f"build_inputs must be a list, got {build_inputs} for {rule_name}"
             )
         pkg_build_inputs.update(build_inputs)
         function_arguments.update(args)
-        if body:
-            function_body += [body]
+        if attr_set_parts:
+            for k, v in attr_set_parts.values():
+                if not k in pkg_attr_set_parts:
+                    pkg_attr_set_parts[k] = []
+                elif k == "patchPhase":
+                    pkg_attr_set_parts[k] += " + " + pkg_attr_set_parts
+                else:
+                    raise ValueError(f"Think up a merge strategy for {k}")
     if pkg_build_inputs:
         function_arguments.add("final")
 
-    str_native_build_inputs = " ".join([f"final.{x}" for x in pkg_build_inputs])
-    function_body.insert(
-        0,
-        "{nativeBuildInputs = old.nativeBuildInputs or [] ++ ["
-        + str_native_build_inputs
-        + "] ;}",
-    )
-    str_function_body = " // \n".join(function_body)
+    pkg_build_inputs = [nix_literal("final." + x) for x in pkg_build_inputs]
+    if pkg_build_inputs and pkg_attr_set_parts.get("nativeBuildInputs", []):
+        pkg_attr_set_parts["nativeBuildInputs"] = nix_literal(
+            "old.nativeBuildInputs or [] ++ "
+            + nix_format(pkg_attr_set_parts["nativeBuildInputs"])
+            + " ++ "
+            + nix_format(pkg_build_inputs)
+        )
+    elif pkg_build_inputs:
+        pkg_attr_set_parts["nativeBuildInputs"] = nix_literal(
+            "old.nativeBuildInputs or [] ++ " + nix_format(pkg_build_inputs)
+        )
+    elif pkg_attr_set_parts.get("nativeBuildInputs", []):
+        pkg_attr_set_parts["nativeBuildInputs"] = nix_literal(
+            "old.nativeBuildInputs or [] ++ "
+            + nix_format(pkg_attr_set_parts["nativeBuildInputs"])
+        )
+
+    str_function_body = nix_format(pkg_attr_set_parts)
     path.write_text(f"""
         {{{", ".join(function_arguments)}, ...}}: old: {str_function_body}
     """)
@@ -200,32 +232,28 @@ def check_for_wheel_build(drv):
     return src.endswith(".whl")
 
 
-def drv_to_pkg_and_version(drv):
-    # print(drv, len(log))
-    nix_name = drv.split("/")[-1]
-    parts = nix_name[:-4].rsplit("-")
-    version = parts[-1]
-    pkg = "-".join(parts[2:-1])
-    pkg_tuple = (pkg, version)
-    return pkg_tuple
+def copy_if_non_value(value):
+    try:
+        return value.copy()
+    except AttributeError:
+        return value
 
 
 def apply_rules(project_folder, overrides_folder, failures):
-    print("apply rules", len(failures))
+    log.debug(f"Applying rules to {len(failures)} failures")
     any_applied = False
     rules_so_far = {}
     for drv, log in failures.items():
         pkg_tuple = drv_to_pkg_and_version(drv)
         is_wheel = check_for_wheel_build(drv)
         rules_here = load_existing_rules(overrides_folder, *pkg_tuple, is_wheel)
-        print(pkg_tuple, "is_wheel", is_wheel)
         for rule_name in dir(rules):
             rule = getattr(rules, rule_name)
             if isinstance(rule, type):
-                print(f"checking rule {rule_name} in {pkg_tuple}")
+                log.debug(f"checking rule {rule_name} in {pkg_tuple}")
                 old_opts = rules_here.get(rule_name)
-                if opts := rule.match(drv, log, old_opts.copy() if old_opts is not None else None):
-                    print("\t Hit!")
+                if opts := rule.match(drv, log, copy_if_non_value(old_opts)):
+                    log.debug("\t Hit!")
                     rules_here[rule_name] = opts
                     any_applied = opts != old_opts
         rules_so_far[pkg_tuple, is_wheel] = rules_here
@@ -246,7 +274,13 @@ def write_rules(any_applied, rules_so_far, overrides_folder):
             path.parent.mkdir(exist_ok=True, parents=True)
             toml.dump(rules_here, path.open("w"))
             write_combined_rules(path.with_name("default.nix"), rules_here)
-        subprocess.check_call(["python", "dev/collect.py"], cwd=overrides_folder, stderr=subprocess.PIPE)
+        p = subprocess.Popen(
+            ["python", "dev/collect.py"], cwd=overrides_folder, stderr=subprocess.PIPE
+        )
+        stdout, stderr= p.communicate()
+        if p.returncode != 0:
+            log.error(stderr)
+            raise ValueError(f"Failed to collect overrides with dev/collect.py: ")
         subprocess.check_call(["git", "add", "."], cwd=overrides_folder)
     return any_applied
 
@@ -302,6 +336,21 @@ def get_parser():
     return p
 
 
+def extract_sources(src_folder, failures):
+    for drv in failures:
+        pkg, version = drv_to_pkg_and_version(drv)
+        src = get_src(drv)
+        (src_folder / pkg / version).mkdir(exist_ok=True, parents=True)
+        if src.endswith(".tar.gz"):
+            with tarfile.open(src) as tf:
+                tf.extractall(src_folder / pkg / version)
+        elif src.endswith(".zip"):
+            with zipfile.ZipFile(src) as zf:
+                zf.extractall(src_folder / pkg / version)
+        else:
+            log.warn(f"Unknown archive type, not unpacked {src}")
+
+
 def main():
     args = get_parser().parse_args()
     target_pkg = args.target_pkg
@@ -315,12 +364,13 @@ def main():
     target_folder = Path(f"hammer_build_{target_pkg}_{target_pkg_version}")
     target_folder.mkdir(exist_ok=True)
     project_folder = target_folder / "build"
+    src_folder = target_folder / "src"
     overrides_folder = target_folder / "overrides"
 
     # clone th overrides repo
     if not overrides_folder.exists():
         overrides_folder.mkdir(exist_ok=True)
-        print("git cloning hammer_overrides")
+        log.debug("git cloning hammer_overrides")
         subprocess.run(["git", "clone", overrides_source, str(overrides_folder)])
         subprocess.run(
             ["git", "switch", "-c", f"{target_pkg}-{target_pkg_version}"],
@@ -383,15 +433,17 @@ def main():
             ],
             cwd=overrides_folder,
         )
-        print(
+        log.info(
             f"We had success building the packages. Check out the (commited) overrides in {overrides_folder} using `git diff HEAD~1 HEAD`"
         )
     else:
-        print(
+        extract_sources(src_folder, failures)
+        log.error(
             f"We failed to achive success in build. Read the error logs in {project_folder} and try to extend the rule set?"
         )
+        log.info(f"The sources of failing packages has been extracted to {src_folder}")
         if max_trials == 0:
-            print("We gave up because the maximum number of trials was reached")
+            log.info("We gave up because the maximum number of trials was reached")
         else:
-            print("we gave up because we had no further rules")
+            log.info("we gave up because we had no further rules")
         sys.exit(1)

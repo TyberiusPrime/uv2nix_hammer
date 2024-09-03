@@ -4,6 +4,15 @@ import toml
 import json
 import subprocess
 
+def drv_to_pkg_and_version(drv):
+    # print(drv, len(log))
+    nix_name = drv.split("/")[-1]
+    parts = nix_name[:-4].rsplit("-")
+    version = parts[-1]
+    pkg = "-".join(parts[2:-1])
+    pkg_tuple = (pkg, version)
+    return pkg_tuple
+
 
 def extract_pyproject_toml_from_archive(src_path):
     if src_path.endswith(".tar.gz"):

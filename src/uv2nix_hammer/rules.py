@@ -38,7 +38,25 @@ class BuildSystems:
 
     @staticmethod
     def apply(opts):
-        return (opts, [], "")
+        return (opts, [], {})
+
+
+class TomlRequiresPatcher:
+    @staticmethod
+    def match(drv, log, opts):
+        return "Missing dependencies:" in log and "setuptools_scm<" in log
+
+    @staticmethod
+    def apply(opts):
+        return (
+            [],
+            ["helpers"],
+            {
+                "patchPhase": """
+                ${helpers.tomlreplace} pyproject.toml build-system.requires "[]"
+        """
+            },
+        )
 
 
 # class SetuptoolsSCM:
