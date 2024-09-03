@@ -1,4 +1,6 @@
 import sys
+import tarfile
+import zipfile
 import urllib3
 import json
 import argparse
@@ -7,6 +9,7 @@ import re
 from pathlib import Path
 import subprocess
 from . import rules
+from .helpers import get_src
 
 
 def write_pyproject_toml(folder, pkg, pkg_version):
@@ -30,11 +33,13 @@ def write_flake_nix(
     (folder / "flake.nix").write_text(f"""
 {{
   description = "A basic flake using uv2nix";
-
-  inputs.uv2nix.url = "{uv2nix_repo}";
-  inputs.uv2nix.inputs.nixpkgs.follows = "nixpkgs";
-  inputs.uv2nix_hammer_overrides.url = "{hammer_overrides_folder.absolute()}";
-  inputs.uv2nix_hammer_overrides.inputs.nixpkgs.follows = "nixpkgs";
+  inputs = {{
+      nixpkgs.url = "github:nixos/nixpkgs/24.05";
+      uv2nix.url = "{uv2nix_repo}";
+      uv2nix.inputs.nixpkgs.follows = "nixpkgs";
+      uv2nix_hammer_overrides.url = "{hammer_overrides_folder.absolute()}";
+      uv2nix_hammer_overrides.inputs.nixpkgs.follows = "nixpkgs";
+  }};
   outputs = {{
     nixpkgs,
     uv2nix,
@@ -78,7 +83,7 @@ def verify_target_on_pypi(pkg, version):
     url = f"https://pypi.org/pypi/{pkg}/json"
     resp = urllib3.request("GET", url)
     json = resp.json()
-    if json.get('message') == 'Not Found':
+    if json.get("message") == "Not Found":
         raise ValueError("package not on pypi")
     if version is None:
         releases = json["releases"]
@@ -112,12 +117,16 @@ def attempt_build(project_folder):
     subprocess.check_call(
         ["nix", "flake", "lock", "--update-input", "uv2nix_hammer_overrides"],
         cwd=project_folder,
+        stderr=subprocess.PIPE,
     )
     subprocess.run(
         ["nix", "build", "--keep-going"],
         cwd=project_folder,
         stderr=(project_folder / f"run_{attempt_no}.log").open("w"),
     )
+    stderr = (project_folder / f"run_{attempt_no}.log").read_text()
+    if "while evaluating the attribute" in stderr:
+        raise ValueError("Generated overwrites were not valid nix code")
     return attempt_no
 
 
@@ -127,7 +136,9 @@ def remove_old_logs(project_folder):
 
 
 def get_nix_log(drv):
-    return subprocess.check_output(["nix", "log", drv], text=True)
+    return subprocess.check_output(
+        ["nix", "log", drv], text=True, stderr=subprocess.PIPE
+    )
 
 
 def load_failures(project_folder, run_no):
@@ -147,31 +158,56 @@ def load_existing_rules(overrides_folder, pkg, pkg_version, is_wheel):
     )
 
     if path.exists():
-        return toml.load(path)["rules"]
+        return toml.load(path)
     else:
-        return []
+        return {}
 
 
 def write_combined_rules(path, rules_to_combine):
     function_arguments = set()
-    function_body = ""
-    for rule_name in rules_to_combine:
+    function_body = []
+    pkg_build_inputs = set()
+
+    for rule_name in rules_to_combine.keys():
         rule = getattr(rules, rule_name)
-        args, body = rule.apply()
+        build_inputs, args, body = rule.apply(rules_to_combine[rule_name])
+        if not isinstance(build_inputs, list):
+            raise ValueError(
+                f"build_inputs must be a list, got {build_inputs} for {rule_name}"
+            )
+        pkg_build_inputs.update(build_inputs)
         function_arguments.update(args)
-        function_body += body
+        if body:
+            function_body += [body]
+    if pkg_build_inputs:
+        function_arguments.add("final")
+
+    str_native_build_inputs = " ".join([f"final.{x}" for x in pkg_build_inputs])
+    function_body.insert(
+        0,
+        "{nativeBuildInputs = old.nativeBuildInputs or [] ++ ["
+        + str_native_build_inputs
+        + "] ;}",
+    )
+    str_function_body = " // \n".join(function_body)
     path.write_text(f"""
-    {{{", ".join(function_arguments)}, ...}}: {function_body}
+        {{{", ".join(function_arguments)}, ...}}: old: {str_function_body}
     """)
 
 
 def check_for_wheel_build(drv):
-    derivation = json.loads(
-        subprocess.check_output(["nix", "show-derivation", drv], text=True)
-    )[drv]
-    env = derivation["env"]
-    src = env["src"]
+    src = get_src(drv)
     return src.endswith(".whl")
+
+
+def drv_to_pkg_and_version(drv):
+    # print(drv, len(log))
+    nix_name = drv.split("/")[-1]
+    parts = nix_name[:-4].rsplit("-")
+    version = parts[-1]
+    pkg = "-".join(parts[2:-1])
+    pkg_tuple = (pkg, version)
+    return pkg_tuple
 
 
 def apply_rules(project_folder, overrides_folder, failures):
@@ -179,26 +215,25 @@ def apply_rules(project_folder, overrides_folder, failures):
     any_applied = False
     rules_so_far = {}
     for drv, log in failures.items():
-        print(drv, len(log))
-        nix_name = drv.split("/")[-1]
-        parts = nix_name[:-4].rsplit("-")
-        version = parts[-1]
-        pkg = "-".join(parts[2:-1])
-        pkg_tuple = (pkg, version)
+        pkg_tuple = drv_to_pkg_and_version(drv)
         is_wheel = check_for_wheel_build(drv)
         rules_here = load_existing_rules(overrides_folder, *pkg_tuple, is_wheel)
-        print(pkg_tuple, 'is_wheel',is_wheel)
+        print(pkg_tuple, "is_wheel", is_wheel)
         for rule_name in dir(rules):
             rule = getattr(rules, rule_name)
             if isinstance(rule, type):
-                if not rule_name in rules_here:
-                    print(f"checking rule {rule_name} in {pkg_tuple}")
-                    if rule.match(log):
-                        print("\t Hit!")
-                        rules_here.append(rule_name)
-                        any_applied = True
+                print(f"checking rule {rule_name} in {pkg_tuple}")
+                old_opts = rules_here.get(rule_name)
+                if opts := rule.match(drv, log, old_opts.copy() if old_opts is not None else None):
+                    print("\t Hit!")
+                    rules_here[rule_name] = opts
+                    any_applied = opts != old_opts
         rules_so_far[pkg_tuple, is_wheel] = rules_here
 
+    return any_applied, rules_so_far
+
+
+def write_rules(any_applied, rules_so_far, overrides_folder):
     if any_applied:
         for ((pkg, version), is_wheel), rules_here in rules_so_far.items():
             path = (
@@ -209,9 +244,10 @@ def apply_rules(project_folder, overrides_folder, failures):
                 / f"rules_{'wheel' if is_wheel else 'src'}.toml"
             )
             path.parent.mkdir(exist_ok=True, parents=True)
-            toml.dump({"rules": rules_here}, path.open("w"))
+            toml.dump(rules_here, path.open("w"))
             write_combined_rules(path.with_name("default.nix"), rules_here)
-    subprocess.check_call(["git", "add", "."], cwd=overrides_folder)
+        subprocess.check_call(["python", "dev/collect.py"], cwd=overrides_folder, stderr=subprocess.PIPE)
+        subprocess.check_call(["git", "add", "."], cwd=overrides_folder)
     return any_applied
 
 
@@ -237,7 +273,7 @@ def clear_existing_overrides(
     if rules_toml.exists():
         rules_toml.unlink()
 
-    rules_toml.write_text(toml.dumps({"rules": []}))
+    rules_toml.write_text(toml.dumps({}))
 
 
 def get_parser():
@@ -323,7 +359,9 @@ def main():
             success = True
             break
         failures = load_failures(project_folder, run_no)
-        if not apply_rules(project_folder, overrides_folder, failures):
+        any_applied, new_rules = apply_rules(project_folder, overrides_folder, failures)
+        write_rules(any_applied, new_rules, overrides_folder)
+        if not any_applied:
             # we had nothing left to try.
             break
         max_trials -= 1
@@ -352,7 +390,7 @@ def main():
         print(
             f"We failed to achive success in build. Read the error logs in {project_folder} and try to extend the rule set?"
         )
-        if max_trials== 0:
+        if max_trials == 0:
             print("We gave up because the maximum number of trials was reached")
         else:
             print("we gave up because we had no further rules")
