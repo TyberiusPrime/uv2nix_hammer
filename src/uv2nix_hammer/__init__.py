@@ -251,7 +251,8 @@ def apply_rules(project_folder, overrides_folder, failures):
         rules_here = load_existing_rules(overrides_folder, *pkg_tuple, is_wheel)
         for rule_name in dir(rules):
             rule = getattr(rules, rule_name)
-            if isinstance(rule, type):
+            # todo: check if it's a helpers.Rule
+            if isinstance(rule, type) and issubclass(rule, rules.Rule) and rule is not rules.Rule:
                 log.debug(f"checking rule {rule_name} in {pkg_tuple}")
                 old_opts = rules_here.get(rule_name)
                 if opts := rule.match(drv, drv_log, copy_if_non_value(old_opts)):

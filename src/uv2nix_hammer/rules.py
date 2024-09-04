@@ -1,7 +1,7 @@
-from .helpers import extract_pyproject_toml_from_archive, get_src, log, RuleOutput
+from .helpers import extract_pyproject_toml_from_archive, get_src, log, RuleOutput, Rule
 
 
-class BuildSystems:
+class BuildSystems(Rule):
     @staticmethod
     def normalize_build_system(bs):
         for char in ">;<=":
@@ -47,7 +47,7 @@ class BuildSystems:
         return RuleOutput(build_inputs=opts)
 
 
-class TomlRequiresPatcher:
+class TomlRequiresPatcher(Rule):
     @staticmethod
     def match(drv, drv_log, opts):
         if "Missing dependencies:" in drv_log:

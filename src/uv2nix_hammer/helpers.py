@@ -69,3 +69,6 @@ class RuleOutput:
         self.wheel_attrset_parts = wheel_attrset_parts
 
 
+
+class Rule: # marker class for rules
+    pass

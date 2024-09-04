@@ -8,7 +8,6 @@ dependencies = [
     "packaging>=24.1",
     "rich>=13.8.0",
     "toml>=0.10.2",
-    "tomlkit>=0.13.2",
     "urllib3",
 ]
 
