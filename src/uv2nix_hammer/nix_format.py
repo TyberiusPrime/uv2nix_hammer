@@ -8,26 +8,28 @@ def nix_identifier(identifier):
         return nix_format(identifier)  # format as string
 
 
+# these must survive toml round tripping, but also be 'value' types so set() compatibl
 def nix_path(path):
-    return ("path", path)
+    return "~path~:!:" + path
 
 
 def nix_literal(path):
-    return ("literal", path)
+    return "~literal:!:" + path
 
 
 def nix_format(value):
     if isinstance(value, str):
-        if "\n" in value:
-            return "''" + value.replace("''", "'''") + "''"
+        if value.startswith("~path~:!:"):
+            return "./" + str(value[8:])
+        elif value.startswith("~literal:!:"):
+            return value[11:]
         else:
-            return '"' + value.replace('"', '\\"') + '"'
+            if "\n" in value:
+                return "''" + value.replace("''", "'''") + "''"
+            else:
+                return '"' + value.replace('"', '\\"') + '"'
     elif isinstance(value, (int, float)):
         return str(value)
-    elif isinstance(value, tuple) and value[0] == "path":
-        return "./" + str(value[1])
-    elif isinstance(value, tuple) and value[0] == "literal":
-        return str(value[1])
     elif isinstance(value, list):
         return "[" + " ".join((nix_format(x) for x in value)) + "]"
     else:

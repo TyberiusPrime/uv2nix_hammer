@@ -13,11 +13,13 @@ from . import rules
 from .helpers import get_src, drv_to_pkg_and_version, log, RuleOutput
 
 import rich.traceback
+from rich.console import Console
 
+console = Console()
 rich.traceback.install(show_locals=True)
 
 
-def write_pyproject_toml(folder, pkg, pkg_version):
+def write_pyproject_toml(folder, pkg, pkg_version, sdist_or_wheel):
     (folder / "pyproject.toml").write_text(
         f"""
 [project]
@@ -29,12 +31,18 @@ dependencies = [
     "{pkg}=={pkg_version}",
 ]
 """
+        + (
+            ""
+            if sdist_or_wheel == "wheel"
+            else f"""
+[tool.uv]
+    no-binary-package = ['{pkg}']
+    """
+        )
     )
 
 
-def write_flake_nix(
-    folder, uv2nix_repo, hammer_overrides_folder, wheel_or_sdist="wheel"
-):
+def write_flake_nix(folder, uv2nix_repo, hammer_overrides_folder):
     (folder / "flake.nix").write_text(f"""
 {{
   description = "A basic flake using uv2nix";
@@ -55,17 +63,24 @@ def write_flake_nix(
 
     workspace = uv2nix.lib.workspace.loadWorkspace {{workspaceRoot = ./.;}};
 
+    pkgs = nixpkgs.legacyPackages.x86_64-linux;
+
     # Manage overlays
     overlay = let
       # Create overlay from workspace.
       overlay' = workspace.mkOverlay {{
-        sourcePreference = "{wheel_or_sdist}";
+        sourcePreference = "wheel";
       }};
-       overrides = (uv2nix_hammer_overrides.overrides);
-    in
-      lib.composeExtensions overlay' overrides;
+      # work around for packaging must-not-be-a-wheel and is best not overwritten
+      overlay'' = pyfinal: pyprev: let
+        applied = overlay' pyfinal pyprev;
+      in
+        lib.filterAttrs (n: _: n != "packaging") applied;
 
-    pkgs = nixpkgs.legacyPackages.x86_64-linux;
+       overrides = (uv2nix_hammer_overrides.overrides pkgs);
+    in
+      lib.composeExtensions overlay'' overrides;
+
     python = pkgs.python3.override {{
       self = python;
       packageOverrides = overlay;
@@ -82,9 +97,16 @@ def uv_lock(folder):
     subprocess.check_call(["uv", "lock", "--no-cache"], cwd=folder)
 
 
-def verify_target_on_pypi(pkg, version):
+def wrapped_version(x):
     from packaging.version import Version
 
+    try:
+        return Version(x)
+    except:
+        return Version("0.0.0")
+
+
+def verify_target_on_pypi(pkg, version):
     url = f"https://pypi.org/pypi/{pkg}/json"
     resp = urllib3.request("GET", url)
     json = resp.json()
@@ -93,7 +115,7 @@ def verify_target_on_pypi(pkg, version):
     if version is None:
         releases = json["releases"]
         # sort with Version aware sort?
-        version = sorted(releases.keys(), reverse=True, key=Version)[0]
+        version = sorted(releases.keys(), reverse=True, key=wrapped_version)[0]
     else:
         if not version in json["releases"]:
             log.error(f"No release {version} for {pkg} not found on pypi")
@@ -119,6 +141,7 @@ def attempt_build(project_folder):
     attempt_no = 0
     while (project_folder / f"run_{attempt_no}.log").exists():
         attempt_no += 1
+    log.debug(f"Attempting build, trial no {attempt_no}")
     subprocess.check_call(
         ["nix", "flake", "lock", "--update-input", "uv2nix_hammer_overrides"],
         cwd=project_folder,
@@ -156,15 +179,8 @@ def load_failures(project_folder, run_no):
 
 
 def load_existing_rules(overrides_folder, pkg, pkg_version, is_wheel):
-    path = (
-        overrides_folder
-        / "overrides"
-        / pkg
-        / pkg_version
-        / f"rules_{'wheel' if is_wheel else 'src'}.toml"
-    )
+    path = overrides_folder / "overrides" / pkg / pkg_version / f"rules.toml"
 
-    print(path)
     if path.exists():
         return toml.load(path)
     else:
@@ -173,7 +189,6 @@ def load_existing_rules(overrides_folder, pkg, pkg_version, is_wheel):
 
 def write_combined_rules(path, rules_to_combine):
     from .nix_format import nix_format, nix_literal
-    print(rules_to_combine)
 
     function_arguments = set()
     src_attrset_parts = {}
@@ -197,6 +212,8 @@ def write_combined_rules(path, rules_to_combine):
                     dest[k] = v
                 elif k == "patchPhase":
                     dest[k] += " + " + v
+                elif k == "nativeBuildInputs" or k == "buildInputs":
+                    dest[k] = sorted(set(dest[k] + v))
                 else:
                     raise ValueError(f"Think up a merge strategy for {k}")
 
@@ -221,12 +238,25 @@ def write_combined_rules(path, rules_to_combine):
             + nix_format(src_attrset_parts["nativeBuildInputs"])
         )
 
+    if "buildInputs" in src_attrset_parts:
+        src_attrset_parts["buildInputs"] = nix_literal(
+            "old.buildInputs or [] ++ " + nix_format(src_attrset_parts["buildInputs"])
+        )
+    if "buildInputs" in wheel_attrset_parts:
+        wheel_attrset_parts["buildInputs"] = nix_literal(
+            "old.buildInputs or [] ++ " + nix_format(wheel_attrset_parts["buildInputs"])
+        )
+
     src_body = nix_format(src_attrset_parts)
     wheel_body = nix_format(wheel_attrset_parts)
     path.write_text(f"""
         {{{", ".join(function_arguments)}, ...}}: old: if ((old.format or "sdist") == "wheel") then {wheel_body} else {src_body}
     """)
-    subprocess.check_call(["nix", "fmt", str(path.absolute())], cwd=path.parent)
+    subprocess.check_call(
+        ["nix", "fmt", str(path.absolute())],
+        cwd=path.parent.parent.parent,
+        stderr=subprocess.PIPE,
+    )
 
 
 def check_for_wheel_build(drv):
@@ -247,34 +277,41 @@ def apply_rules(project_folder, overrides_folder, failures):
     rules_so_far = {}
     for drv, drv_log in failures.items():
         pkg_tuple = drv_to_pkg_and_version(drv)
+        if pkg_tuple[0] == "bootstrap-packaging":
+            log.warn(
+                "Skipping apply_rules for bootstrap-packaging - we're not going to override that, it needs to bootstrap from nixpkgs"
+            )
+            continue
         is_wheel = check_for_wheel_build(drv)
         rules_here = load_existing_rules(overrides_folder, *pkg_tuple, is_wheel)
         for rule_name in dir(rules):
             rule = getattr(rules, rule_name)
             # todo: check if it's a helpers.Rule
-            if isinstance(rule, type) and issubclass(rule, rules.Rule) and rule is not rules.Rule:
+            if (
+                isinstance(rule, type)
+                and issubclass(rule, rules.Rule)
+                and rule is not rules.Rule
+            ):
                 log.debug(f"checking rule {rule_name} in {pkg_tuple}")
                 old_opts = rules_here.get(rule_name)
                 if opts := rule.match(drv, drv_log, copy_if_non_value(old_opts)):
-                    log.debug(f"\t Hit! {opts}")
                     rules_here[rule_name] = opts
-                    any_applied = opts != old_opts
+                    if opts != old_opts:
+                        any_applied = True
+                        log.debug(f"\t Hit! (and changed) {opts} - was {old_opts}")
         rules_so_far[pkg_tuple, is_wheel] = rules_here
 
     return any_applied, rules_so_far
 
 
 def write_rules(any_applied, rules_so_far, overrides_folder):
-    if any_applied: # todo move up...
+    if any_applied:  # todo move up...
         for ((pkg, version), is_wheel), rules_here in rules_so_far.items():
-            path = (
-                overrides_folder
-                / "overrides"
-                / pkg
-                / version
-                / f"rules_{'wheel' if is_wheel else 'src'}.toml"
-            )
+            if not rules_here:
+                continue
+            path = overrides_folder / "overrides" / pkg / version / f"rules.toml"
             path.parent.mkdir(exist_ok=True, parents=True)
+            rules_here = {k: rules_here[k] for k in sorted(rules_here.keys())}
             toml.dump(rules_here, path.open("w"))
             write_combined_rules(path.with_name("default.nix"), rules_here)
         collect_overwrites(overrides_folder)
@@ -334,6 +371,7 @@ def get_parser():
         "target_pkg",
         type=str,
         help="The package to build (from pypi)",
+        nargs="?",
     )
     p.add_argument(
         "target_pkg_version",
@@ -341,12 +379,23 @@ def get_parser():
         help='Version of the package to build. Optional, defaults to "newest"',
         nargs="?",
     )
-    p.add_argument('-r','--rewrite', action="store_true", help="If set, only rewrite default.nix from rules.")
+    p.add_argument(
+        "-r",
+        "--rewrite",
+        action="store_true",
+        help="If set, only rewrite default.nix from rules.",
+    )
     p.add_argument(
         "-s",
         "--sdist",
         action="store_true",
         help="Whether to build from sdist or wheel. Defaults to wheel",
+    )
+    p.add_argument(
+        "-o",
+        "--overrides-folder",
+        action="store",
+        help="Use a different folder for the cloned overrides (allowing for multiple builds)",
     )
     return p
 
@@ -368,22 +417,31 @@ def extract_sources(src_folder, failures):
 
 def main():
     args = get_parser().parse_args()
-    target_pkg = args.target_pkg
-    target_pkg_version = args.target_pkg_version
-    target_pkg_version, had_src = verify_target_on_pypi(target_pkg, target_pkg_version)
     sdist_or_wheel = "sdist" if args.sdist else "wheel"  # the one we put into flake.nix
 
     overrides_source = "https://github.com/TyberiusPrime/uv2nix_hammer_overrides"
     uv2nix = "github:/adisbladis/uv2nix"
 
     if args.rewrite:
+        target_pkg = args.target_pkg
         overrides_folder = Path("hammer_build-rewrite")
     else:
+        target_pkg = args.target_pkg
+        if not target_pkg:
+            raise ValueError("non-rewrite needs target_pkg")
+        target_pkg_version = args.target_pkg_version
+        target_pkg_version, had_src = verify_target_on_pypi(
+            target_pkg, target_pkg_version
+        )
         target_folder = Path(f"hammer_build_{target_pkg}_{target_pkg_version}")
         target_folder.mkdir(exist_ok=True)
         project_folder = target_folder / "build"
         src_folder = target_folder / "src"
-        overrides_folder = target_folder / "overrides"
+        if args.overrides_folder:
+            overrides_folder = Path(args.overrides_folder)
+            log.info(f"Using overrides_folder {overrides_folder}")
+        else:
+            overrides_folder = target_folder / "overrides"
 
     # clone th overrides repo
     if not overrides_folder.exists():
@@ -399,25 +457,32 @@ def main():
         )
 
     if args.rewrite:
-        print(f"rust rewriting rules for {target_pkg}=={target_pkg_version}") 
-        rules_here = load_existing_rules(overrides_folder, target_pkg, target_pkg_version, False)
+        print(f"rust rewriting rules for {target_pkg}=={target_pkg_version}")
+        rules_here = load_existing_rules(
+            overrides_folder, target_pkg, target_pkg_version, False
+        )
         if not rules_here:
             raise ValueError("No rules")
         # I don't think I'm gonna keep rules_wheel actually
-        path = overrides_folder / "overrides" / target_pkg / target_pkg_version / "default.nix"
+        path = (
+            overrides_folder
+            / "overrides"
+            / target_pkg
+            / target_pkg_version
+            / "default.nix"
+        )
         write_combined_rules(path.with_name("default.nix"), rules_here)
 
-
     else:
-
         project_folder.mkdir(exist_ok=True)
         # todo: dependency tracking?
-        if not (project_folder / "pyproject.toml").exists():
-            write_pyproject_toml(project_folder, target_pkg, target_pkg_version)
+        write_pyproject_toml(
+            project_folder, target_pkg, target_pkg_version, sdist_or_wheel
+        )
         if not (project_folder / "uv.lock").exists():
             uv_lock(project_folder)
         # if not (project_folder / "flake.nix").exists():
-        write_flake_nix(project_folder, uv2nix, overrides_folder, sdist_or_wheel)
+        write_flake_nix(project_folder, uv2nix, overrides_folder)
         gitify(project_folder)
 
         remove_old_logs(project_folder)
@@ -430,19 +495,28 @@ def main():
             else:
                 clear = "wheel"
 
-        clear_existing_overrides(overrides_folder, target_pkg, target_pkg_version, clear)
+        clear_existing_overrides(
+            overrides_folder, target_pkg, target_pkg_version, clear
+        )
         if (project_folder / "result").exists():
             (project_folder / "result").unlink()
 
         max_trials = 10
         success = False
+        failures = []
         while max_trials > 0:
-            run_no = attempt_build(project_folder)
+            try:
+                run_no = attempt_build(project_folder)
+            except ValueError:
+                console.print_exception(show_locals=True)
+                break
             if (project_folder / "result").exists():
                 success = True
                 break
             failures = load_failures(project_folder, run_no)
-            any_applied, new_rules = apply_rules(project_folder, overrides_folder, failures)
+            any_applied, new_rules = apply_rules(
+                project_folder, overrides_folder, failures
+            )
             write_rules(any_applied, new_rules, overrides_folder)
             if not any_applied:
                 # we had nothing left to try.
@@ -481,7 +555,9 @@ def main():
             log.error(
                 f"We failed to achive success in build. Read the error logs in {project_folder} and try to extend the rule set?"
             )
-            log.info(f"The sources of failing packages has been extracted to {src_folder}")
+            log.info(
+                f"The sources of failing packages has been extracted to {src_folder}"
+            )
             if max_trials == 0:
                 log.info("We gave up because the maximum number of trials was reached")
             else:
