@@ -30,6 +30,11 @@ def nix_format(value):
                 return '"' + value.replace('"', '\\"') + '"'
     elif isinstance(value, (int, float)):
         return str(value)
+    elif isinstance(value, bool):
+        if value:
+            return 'true'
+        else:
+            return 'false'
     elif isinstance(value, list):
         return "[" + " ".join((nix_format(x) for x in value)) + "]"
     else:

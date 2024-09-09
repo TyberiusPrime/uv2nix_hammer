@@ -19,14 +19,14 @@ console = Console()
 rich.traceback.install(show_locals=True)
 
 
-def write_pyproject_toml(folder, pkg, pkg_version, sdist_or_wheel):
+def write_pyproject_toml(folder, pkg, pkg_version, sdist_or_wheel, python_version):
     (folder / "pyproject.toml").write_text(
         f"""
 [project]
 name = "app"
 version = "0.1.0"
 description = "Learn to build {pkg}"
-requires-python = ">=3.11"
+requires-python = "~={python_version}"
 dependencies = [
     "{pkg}=={pkg_version}",
 ]
@@ -42,7 +42,8 @@ dependencies = [
     )
 
 
-def write_flake_nix(folder, uv2nix_repo, hammer_overrides_folder):
+def write_flake_nix(folder, uv2nix_repo, hammer_overrides_folder, python_version):
+    flatpythonver = python_version.replace(".", "")
     (folder / "flake.nix").write_text(f"""
 {{
   description = "A basic flake using uv2nix";
@@ -81,7 +82,7 @@ def write_flake_nix(folder, uv2nix_repo, hammer_overrides_folder):
     in
       lib.composeExtensions overlay'' overrides;
 
-    python = pkgs.python3.override {{
+    python = pkgs.python{flatpythonver}.override {{
       self = python;
       packageOverrides = overlay;
     }};
@@ -141,7 +142,7 @@ def attempt_build(project_folder):
     attempt_no = 0
     while (project_folder / f"run_{attempt_no}.log").exists():
         attempt_no += 1
-    log.debug(f"Attempting build, trial no {attempt_no}")
+    log.info(f"Attempting build, trial no {attempt_no}")
     subprocess.check_call(
         ["nix", "flake", "lock", "--update-input", "uv2nix_hammer_overrides"],
         cwd=project_folder,
@@ -208,12 +209,14 @@ def write_combined_rules(path, rules_to_combine):
             (rule_output.wheel_attrset_parts, wheel_attrset_parts),
         ):
             for k, v in src.items():
-                if not k in dest:
-                    dest[k] = v
-                elif k == "patchPhase":
-                    dest[k] += " + " + v
+                if k == "postPatch":
+                    if not k in dest:
+                        dest[k] = [nix_literal('old.postPatch or ""')]
+                    dest[k] += [v]
                 elif k == "nativeBuildInputs" or k == "buildInputs":
-                    dest[k] = sorted(set(dest[k] + v))
+                    dest[k] = sorted(set(dest.get(k, []) + v))
+                elif not k in dest:
+                    dest[k] = v
                 else:
                     raise ValueError(f"Think up a merge strategy for {k}")
 
@@ -247,16 +250,27 @@ def write_combined_rules(path, rules_to_combine):
             "old.buildInputs or [] ++ " + nix_format(wheel_attrset_parts["buildInputs"])
         )
 
+    if "postPatch" in src_attrset_parts:
+        src_attrset_parts["postPatch"] = nix_literal(
+            "+".join(
+                ("(" + nix_format(x) + ")" for x in src_attrset_parts["postPatch"])
+            )
+        )
     src_body = nix_format(src_attrset_parts)
     wheel_body = nix_format(wheel_attrset_parts)
     path.write_text(f"""
         {{{", ".join(function_arguments)}, ...}}: old: if ((old.format or "sdist") == "wheel") then {wheel_body} else {src_body}
     """)
-    subprocess.check_call(
+    p = subprocess.Popen(
         ["nix", "fmt", str(path.absolute())],
         cwd=path.parent.parent.parent,
+        stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    stdout, stderr = p.communicate()
+    if p.returncode != 0:
+        print(stderr)
+        raise ValueError("nix fmt failed")
 
 
 def check_for_wheel_build(drv):
@@ -298,7 +312,7 @@ def apply_rules(project_folder, overrides_folder, failures):
                     rules_here[rule_name] = opts
                     if opts != old_opts:
                         any_applied = True
-                        log.debug(f"\t Hit! (and changed) {opts} - was {old_opts}")
+                        log.debug(f"\tHit! (and changed) {opts} - was {old_opts}")
         rules_so_far[pkg_tuple, is_wheel] = rules_here
 
     return any_applied, rules_so_far
@@ -338,27 +352,28 @@ def clear_existing_overrides(
     """Note that sdist_or_wheel is for this package and derived from pypi
     if --sdist is not set. Package might not have a wheel dist.
     """
-    is_wheel = sdist_or_wheel == "wheel"
-    default_nix = (
-        overrides_folder / "overrides" / target_pkg / target_pkg_version / "default.nix"
-    )
-    default_nix.parent.mkdir(exist_ok=True, parents=True)
-    collect = False
-    if default_nix.exists():
-        default_nix.unlink()
-        collect = True
-    rules_toml = (
-        overrides_folder
-        / "overrides"
-        / target_pkg
-        / target_pkg_version
-        / f"rules_{'wheel' if is_wheel else 'src'}.toml"
-    )
-    if rules_toml.exists():
-        rules_toml.unlink()
+    pass
+    # is_wheel = sdist_or_wheel == "wheel"
+    # default_nix = (
+    #     overrides_folder / "overrides" / trget_pkg / target_pkg_version / "default.nix"
+    # )
+    # default_nix.parent.mkdir(exist_ok=True, parents=True)
+    # collect = False
+    # if default_nix.exists():
+    #     default_nix.unlink()
+    #     collect = True
+    # rules_toml = (
+    #     overrides_folder
+    #     / "overrides"
+    #     / target_pkg
+    #     / target_pkg_version
+    #     / f"rules_{'wheel' if is_wheel else 'src'}.toml"
+    # )
+    # if rules_toml.exists():
+    #     rules_toml.unlink()
 
-    if collect:
-        collect_overwrites(overrides_folder)
+    # if collect:
+    #     collect_overwrites(overrides_folder)
 
 
 def get_parser():
@@ -386,10 +401,10 @@ def get_parser():
         help="If set, only rewrite default.nix from rules.",
     )
     p.add_argument(
-        "-s",
-        "--sdist",
+        "-w",
+        "--wheel",
         action="store_true",
-        help="Whether to build from sdist or wheel. Defaults to wheel",
+        help="Whether to build the top level pkg from sdist or wheel. Defaults to sdist",
     )
     p.add_argument(
         "-o",
@@ -397,6 +412,13 @@ def get_parser():
         action="store",
         help="Use a different folder for the cloned overrides (allowing for multiple builds)",
     )
+    p.add_argument(
+        "-p",
+        "--python-version",
+        action="store",
+        help="python to use. Default 3.12",
+    )
+
     return p
 
 
@@ -417,10 +439,11 @@ def extract_sources(src_folder, failures):
 
 def main():
     args = get_parser().parse_args()
-    sdist_or_wheel = "sdist" if args.sdist else "wheel"  # the one we put into flake.nix
+    sdist_or_wheel = "wheel" if args.wheel else "sdist"  # the one we put into flake.nix
 
     overrides_source = "https://github.com/TyberiusPrime/uv2nix_hammer_overrides"
     uv2nix = "github:/adisbladis/uv2nix"
+    uv2nix = "/home/finkernagel/upstream/uvdev/uv2nix"
 
     if args.rewrite:
         target_pkg = args.target_pkg
@@ -442,6 +465,7 @@ def main():
             log.info(f"Using overrides_folder {overrides_folder}")
         else:
             overrides_folder = target_folder / "overrides"
+        python_version = args.python_version or "3.12"
 
     # clone th overrides repo
     if not overrides_folder.exists():
@@ -477,12 +501,16 @@ def main():
         project_folder.mkdir(exist_ok=True)
         # todo: dependency tracking?
         write_pyproject_toml(
-            project_folder, target_pkg, target_pkg_version, sdist_or_wheel
+            project_folder,
+            target_pkg,
+            target_pkg_version,
+            sdist_or_wheel,
+            python_version,
         )
         if not (project_folder / "uv.lock").exists():
             uv_lock(project_folder)
         # if not (project_folder / "flake.nix").exists():
-        write_flake_nix(project_folder, uv2nix, overrides_folder)
+        write_flake_nix(project_folder, uv2nix, overrides_folder, python_version)
         gitify(project_folder)
 
         remove_old_logs(project_folder)

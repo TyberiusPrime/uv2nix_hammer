@@ -1,4 +1,5 @@
 import tarfile
+import urllib3
 import logging
 import zipfile
 import toml
@@ -31,7 +32,7 @@ def extract_pyproject_toml_from_archive(src_path):
         for fn in tf.getnames():
             if fn.endswith("pyproject.toml"):
                 candidates.append(fn)
-        candidates.sort(key = lambda x: len(x))
+        candidates.sort(key=lambda x: len(x))
         if not candidates:
             raise ValueError("no pyproject.toml")
         with tf.extractfile(candidates[0]) as f:
@@ -59,16 +60,32 @@ def get_src(drv):
 
 
 class RuleOutput:
-
-    def __init__(self, 
-                 build_inputs = [],
-                 arguments = [], src_attrset_parts = {},wheel_attrset_parts = {}):
+    def __init__(
+        self,
+        build_inputs=[],
+        arguments=[],
+        src_attrset_parts={},
+        wheel_attrset_parts={},
+    ):
         self.build_inputs = build_inputs
         self.arguments = arguments
         self.src_attrset_parts = src_attrset_parts
         self.wheel_attrset_parts = wheel_attrset_parts
 
 
-
-class Rule: # marker class for rules
+class Rule:  # marker class for rules
     pass
+
+
+def get_release_date(pkg, version):
+    import datetime
+
+    url = f"https://pypi.org/pypi/{pkg}/json"
+    resp = urllib3.request("GET", url)
+    json = resp.json()
+    latest = datetime.datetime(2000, 1, 1)
+    for file in json["releases"][version]:
+        upload_time = datetime.datetime.fromisoformat(file["upload_time"])
+        if upload_time > latest:
+            latest = upload_time
+    return latest
