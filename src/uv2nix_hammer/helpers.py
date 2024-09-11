@@ -47,6 +47,14 @@ def extract_pyproject_toml_from_archive(src_path):
     else:
         raise ValueError("not an archive")
 
+def has_pyproject_toml(drv):
+    src = get_src(drv)
+    try:
+        extract_pyproject_toml_from_archive(src)
+        return True
+    except:
+        return False
+
 
 def get_src(drv):
     derivation = json.loads(
@@ -66,11 +74,18 @@ class RuleOutput:
         arguments=[],
         src_attrset_parts={},
         wheel_attrset_parts={},
+        requires_nixpkgs_master = False
     ):
         self.build_inputs = build_inputs
         self.arguments = arguments
         self.src_attrset_parts = src_attrset_parts
         self.wheel_attrset_parts = wheel_attrset_parts
+        self.requires_nixpkgs_master = requires_nixpkgs_master
+
+class RuleFunctionOutput:
+    def __init__(self, nix_func):
+        self.inner = nix_func
+
 
 
 class Rule:  # marker class for rules
@@ -89,3 +104,7 @@ def get_release_date(pkg, version):
         if upload_time > latest:
             latest = upload_time
     return latest
+
+
+def normalize_python_package_name(pkg):
+    return pkg.lower().replace("_","-")

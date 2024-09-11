@@ -1,16 +1,27 @@
 import sys
+import time
+import datetime
 import tarfile
 from typing import override
 import zipfile
+
 import urllib3
 import json
+import networkx
 import argparse
 import toml
 import re
 from pathlib import Path
 import subprocess
 from . import rules
-from .helpers import get_src, drv_to_pkg_and_version, log, RuleOutput
+from .helpers import (
+    get_src,
+    drv_to_pkg_and_version,
+    log,
+    RuleOutput,
+    normalize_python_package_name,
+    RuleFunctionOutput,
+)
 
 import rich.traceback
 from rich.console import Console
@@ -42,13 +53,19 @@ dependencies = [
     )
 
 
-def write_flake_nix(folder, uv2nix_repo, hammer_overrides_folder, python_version):
+def write_flake_nix(
+    folder,
+    uv2nix_repo,
+    hammer_overrides_folder,
+    python_version,
+    nixpkgs_version="24.05",
+):
     flatpythonver = python_version.replace(".", "")
     (folder / "flake.nix").write_text(f"""
 {{
   description = "A basic flake using uv2nix";
   inputs = {{
-      nixpkgs.url = "github:nixos/nixpkgs/24.05";
+      nixpkgs.url = "github:nixos/nixpkgs/{nixpkgs_version}";
       uv2nix.url = "{uv2nix_repo}";
       uv2nix.inputs.nixpkgs.follows = "nixpkgs";
       uv2nix_hammer_overrides.url = "{hammer_overrides_folder.absolute()}";
@@ -64,7 +81,7 @@ def write_flake_nix(folder, uv2nix_repo, hammer_overrides_folder, python_version
 
     workspace = uv2nix.lib.workspace.loadWorkspace {{workspaceRoot = ./.;}};
 
-    pkgs = nixpkgs.legacyPackages.x86_64-linux;
+    pkgs = import nixpkgs {{system="x86_64-linux"; config.allowUnfree = true;}};
 
     # Manage overlays
     overlay = let
@@ -76,7 +93,7 @@ def write_flake_nix(folder, uv2nix_repo, hammer_overrides_folder, python_version
       overlay'' = pyfinal: pyprev: let
         applied = overlay' pyfinal pyprev;
       in
-        lib.filterAttrs (n: _: n != "packaging") applied;
+        lib.filterAttrs (n: _: n != "packaging" && n != "tomli" && n != "pyproject-hooks" && n != "build" && n != "wheel") applied;
 
        overrides = (uv2nix_hammer_overrides.overrides pkgs);
     in
@@ -107,27 +124,90 @@ def wrapped_version(x):
         return Version("0.0.0")
 
 
-def verify_target_on_pypi(pkg, version):
-    url = f"https://pypi.org/pypi/{pkg}/json"
-    resp = urllib3.request("GET", url)
-    json = resp.json()
-    if json.get("message") == "Not Found":
+def get_pypi_json(pkg, cache_folder):
+    cache_folder.mkdir(exist_ok=True, parents=True)
+    fn = cache_folder / f"{pkg}.json"
+    if not fn.exists() or (fn.stat().st_mtime - time.time()) > 60 * 60 * 24:
+        url = f"https://pypi.org/pypi/{pkg}/json"
+        resp = urllib3.request("GET", url)
+        fn.write_text(resp.data.decode())
+    return json.loads(fn.read_text())
+
+
+def is_prerelease(version_string):
+    from packaging.version import Version
+
+    try:
+        return Version(version_string).is_prerelease
+    except:
+        return False
+
+
+def verify_target_on_pypi(pkg, version, cache_folder):
+    info = get_pypi_json(pkg, cache_folder)
+    if info.get("message") == "Not Found":
         raise ValueError("package not on pypi")
     if version is None:
-        releases = json["releases"]
+        releases = {k: v for (k, v) in info["releases"].items() if not is_prerelease(k)}
+
         # sort with Version aware sort?
-        version = sorted(releases.keys(), reverse=True, key=wrapped_version)[0]
+        try:
+            version = sorted(releases.keys(), reverse=True, key=wrapped_version)[0]
+        except IndexError:
+            raise ValueError("No non-pre release found")
     else:
-        if not version in json["releases"]:
+        if not version in info["releases"]:
             log.error(f"No release {version} for {pkg} not found on pypi")
             sys.exit(1)
 
     had_src = False
-    for value in json["releases"][version]:
+    for value in info["releases"][version]:
         if value.get("url").endswith(".tar.gz"):
             had_src = True
             break
     return version, had_src
+
+
+def get_python_release_dates(cache_folder):
+    release_dates = {
+        "3.13": "2024-10-01",
+        "3.12": "2023-10-02",
+        "3.11": "2022-10-24",
+        "3.10": "2021-10-04",
+        "3.9": "2020-10-05",
+    }
+    release_dates = {
+        k: datetime.date.fromisoformat(v) for k, v in release_dates.items()
+    }
+    return release_dates
+
+
+def newest_python_at_pkg_release(pkg, version, cache_folder):
+    # question 0: what
+    info = get_pypi_json(pkg, cache_folder)
+    release = info["releases"][version]
+    try:
+        release_date = datetime.datetime.fromisoformat(release[0]["upload_time"]).date()
+    except IndexError:
+        raise ValueError("No releases available")
+    log.debug(f"Release date for {pkg}=={version} is {release_date}")
+    # question 1:
+    python_release_dates = [
+        (v, k) for (k, v) in get_python_release_dates(cache_folder).items()
+    ]
+    python_release_dates.sort()
+    python_released_before_pkg = [
+        (v, k) for (v, k) in python_release_dates if v < release_date
+    ]
+    if python_released_before_pkg:
+        result = python_released_before_pkg[-1][1]
+        log.debug(f"Chosen python by 'newest-on-release-date': {result}")
+    else:
+        result = python_release_dates[0][1]
+        log.debug(
+            f"Chosen oldest python version we have {result} - pkg is older than that"
+        )
+    return result
 
 
 def gitify(folder):
@@ -138,10 +218,45 @@ def gitify(folder):
     )
 
 
-def attempt_build(project_folder):
-    attempt_no = 0
-    while (project_folder / f"run_{attempt_no}.log").exists():
-        attempt_no += 1
+def try_to_fix_infinite_recursion(project_folder):
+    # situation: we saw' infinite recursion encountered'.
+    # let's see if there's a loop in uv.lock
+    # and if there is, add a rule to remove it?
+
+    raise ValueError("TODO")
+    cycles = find_cycles_in_uv_lock(project_folder)
+    log.debug("Detected infinite recursion")
+    if not cycles:
+        raise ValueError(
+            "infinite recursion encountered, but no cycles found in uv.lock"
+        )
+    log.debug("Recursion was in uv.lock")
+    uv_lock = toml.loads(Path(project_folder / "uv.lock").read_text())
+    rules = {}
+    seen = set()
+    for cycle in cycles:
+        if frozenset(cycle) in seen:
+            continue
+        first_node = cycle[0]  # Should be enough to remove the first edge. Right?
+        second_node = cycle[1]  # ignore the others edges in the cycle
+        log.debug(f"Fixing by breaking edge {cycle}")
+        packages = [(x["name"], x["version"]) for x in uv_lock["package"]]
+        matching_pkgs = [x for x in packages if x[0] == first_node]
+        first_pkg_version = matching_pkgs[0][1]
+        pkg_tuple = first_node, first_pkg_version
+        rules[pkg_tuple] = {"RemovePropagatedBuildInputs": second_node}
+        # seen.add(frozenset(cycle))
+    return rules
+
+
+class InfiniteRecursionError(ValueError):
+    pass
+
+
+def attempt_build(project_folder, attempt_no):
+    # attempt_no = 0
+    # while (project_folder / f"run_{attempt_no}.log").exists():
+    #     attempt_no += 1
     log.info(f"Attempting build, trial no {attempt_no}")
     subprocess.check_call(
         ["nix", "flake", "lock", "--update-input", "uv2nix_hammer_overrides"],
@@ -154,6 +269,8 @@ def attempt_build(project_folder):
         stderr=(project_folder / f"run_{attempt_no}.log").open("w"),
     )
     stderr = (project_folder / f"run_{attempt_no}.log").read_text()
+    if "infinite recursion encountered" in stderr:
+        raise InfiniteRecursionError()
     if "while evaluating the attribute" in stderr:
         raise ValueError(
             "Generated overwrites were not valid nix code (syntax or semantic)"
@@ -166,9 +283,13 @@ def remove_old_logs(project_folder):
         fn.unlink()
 
 
+def strip_ansi_colors(text):
+    return re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", text)
+
+
 def get_nix_log(drv):
-    return subprocess.check_output(
-        ["nix", "log", drv], text=True, stderr=subprocess.PIPE
+    return strip_ansi_colors(
+        subprocess.check_output(["nix", "log", drv], text=True, stderr=subprocess.PIPE)
     )
 
 
@@ -179,7 +300,7 @@ def load_failures(project_folder, run_no):
     return {drv: get_nix_log(drv) for drv in failed_drvs}
 
 
-def load_existing_rules(overrides_folder, pkg, pkg_version, is_wheel):
+def load_existing_rules(overrides_folder, pkg, pkg_version):
     path = overrides_folder / "overrides" / pkg / pkg_version / f"rules.toml"
 
     if path.exists():
@@ -189,36 +310,50 @@ def load_existing_rules(overrides_folder, pkg, pkg_version, is_wheel):
 
 
 def write_combined_rules(path, rules_to_combine):
-    from .nix_format import nix_format, nix_literal
+    from .nix_format import nix_format, nix_literal, wrapped_nix_literal
 
     function_arguments = set()
     src_attrset_parts = {}
     wheel_attrset_parts = {}
     pkg_build_inputs = set()
+    further_funcs = []
+    requires_nixpkgs_master = False
 
     for rule_name in rules_to_combine.keys():
         rule = getattr(rules, rule_name)
         rule_output = rule.apply(rules_to_combine[rule_name])
-        if not isinstance(rule_output, RuleOutput):
-            raise ValueError(f"rule's apply output was not a RuleOutput)")
-        pkg_build_inputs.update(rule_output.build_inputs)
-        function_arguments.update(rule_output.arguments)
+        if isinstance(rule_output, RuleFunctionOutput):
+            for arg in ["pkgs", "prev", "final"]:
+                if f"{arg}." in rule_output.inner:
+                    function_arguments.add(arg)
+            further_funcs.append("old:" + rule_output.inner)
 
-        for src, dest in (
-            (rule_output.src_attrset_parts, src_attrset_parts),
-            (rule_output.wheel_attrset_parts, wheel_attrset_parts),
-        ):
-            for k, v in src.items():
-                if k == "postPatch":
-                    if not k in dest:
-                        dest[k] = [nix_literal('old.postPatch or ""')]
-                    dest[k] += [v]
-                elif k == "nativeBuildInputs" or k == "buildInputs":
-                    dest[k] = sorted(set(dest.get(k, []) + v))
-                elif not k in dest:
-                    dest[k] = v
-                else:
-                    raise ValueError(f"Think up a merge strategy for {k}")
+        elif isinstance(rule_output, RuleOutput):
+            pkg_build_inputs.update(rule_output.build_inputs)
+            function_arguments.update(rule_output.arguments)
+
+            for src, dest in (
+                (rule_output.src_attrset_parts, src_attrset_parts),
+                (rule_output.wheel_attrset_parts, wheel_attrset_parts),
+            ):
+                for k, v in src.items():
+                    if k == "postPatch":
+                        if not k in dest:
+                            dest[k] = [nix_literal('old.postPatch or ""')]
+                        dest[k] += [v]
+                    elif k == "nativeBuildInputs" or k == "buildInputs":
+                        dest[k] = sorted(set(dest.get(k, []) + v))
+                    elif not k in dest:
+                        dest[k] = v
+                    else:
+                        raise ValueError(f"Think up a merge strategy for {k}")
+            if rule_output.requires_nixpkgs_master:
+                log.debug(f"Enabled nixpkgs master because of rule {rule_name} - {path}")
+                requires_nixpkgs_master = True
+        else:
+            raise ValueError(
+                f"rule's apply output was not a RuleOutput or RuleFunctionOutput)"
+            )
 
     if pkg_build_inputs:
         function_arguments.add("final")
@@ -258,9 +393,38 @@ def write_combined_rules(path, rules_to_combine):
         )
     src_body = nix_format(src_attrset_parts)
     wheel_body = nix_format(wheel_attrset_parts)
-    path.write_text(f"""
-        {{{", ".join(function_arguments)}, ...}}: old: if ((old.format or "sdist") == "wheel") then {wheel_body} else {src_body}
-    """)
+    funcs = []
+    if src_attrset_parts or wheel_attrset_parts:
+        funcs.append(
+            f"""old: if ((old.format or "sdist") == "wheel") then {wheel_body} else {src_body}"""
+        )
+    funcs.extend(further_funcs)
+    if function_arguments:
+        head = f"{{{", ".join(function_arguments)}, ...}}"
+    else:
+        head = "{...}"
+    if len(funcs) == 1:
+        out_body = f"""
+        {head}: {funcs[0]}
+        """
+    else:
+        str_funcs = nix_format(
+            [
+                wrapped_nix_literal(f.replace("old:", "old: old // (") + ")")
+                for f in funcs
+            ]
+        )
+        function_arguments.add("pkgs")
+
+        out_body = f"""
+        {head}: 
+            old: 
+            let funcs = {str_funcs};
+            in 
+            pkgs.lib.trivial.pipe old funcs
+    """
+
+    path.write_text(out_body)
     p = subprocess.Popen(
         ["nix", "fmt", str(path.absolute())],
         cwd=path.parent.parent.parent,
@@ -270,7 +434,8 @@ def write_combined_rules(path, rules_to_combine):
     stdout, stderr = p.communicate()
     if p.returncode != 0:
         print(stderr)
-        raise ValueError("nix fmt failed")
+        raise ValueError(f"nix fmt failed {path.absolute()}")
+    return requires_nixpkgs_master
 
 
 def check_for_wheel_build(drv):
@@ -291,45 +456,51 @@ def apply_rules(project_folder, overrides_folder, failures):
     rules_so_far = {}
     for drv, drv_log in failures.items():
         pkg_tuple = drv_to_pkg_and_version(drv)
-        if pkg_tuple[0] == "bootstrap-packaging":
+        if pkg_tuple[0] in (
+            "bootstrap-packaging",
+            "bootstrap-tomli",
+            "bootstrap-build",
+        ):
             log.warn(
-                "Skipping apply_rules for bootstrap-packaging - we're not going to override that, it needs to bootstrap from nixpkgs"
+                f"Skipping apply_rules for {pkg_tuple[0]} - we're not going to override that, it needs to bootstrap from nixpkgs"
             )
             continue
-        is_wheel = check_for_wheel_build(drv)
-        rules_here = load_existing_rules(overrides_folder, *pkg_tuple, is_wheel)
+        # is_wheel = check_for_wheel_build(drv)
+        rules_here = load_existing_rules(overrides_folder, *pkg_tuple)
         for rule_name in dir(rules):
             rule = getattr(rules, rule_name)
-            # todo: check if it's a helpers.Rule
             if (
                 isinstance(rule, type)
                 and issubclass(rule, rules.Rule)
                 and rule is not rules.Rule
             ):
-                log.debug(f"checking rule {rule_name} in {pkg_tuple}")
+                # log.debug(f"checking rule {rule_name} in {pkg_tuple}")
                 old_opts = rules_here.get(rule_name)
                 if opts := rule.match(drv, drv_log, copy_if_non_value(old_opts)):
                     rules_here[rule_name] = opts
                     if opts != old_opts:
                         any_applied = True
-                        log.debug(f"\tHit! (and changed) {opts} - was {old_opts}")
-        rules_so_far[pkg_tuple, is_wheel] = rules_here
+                        log.debug(
+                            f"Rule hit! {rule_name} in {pkg_tuple}}}. Now: {opts} - was: {old_opts}"
+                        )
+        rules_so_far[pkg_tuple] = rules_here
 
     return any_applied, rules_so_far
 
 
 def write_rules(any_applied, rules_so_far, overrides_folder):
+    requires_nixpkgs_master = False
     if any_applied:  # todo move up...
-        for ((pkg, version), is_wheel), rules_here in rules_so_far.items():
+        for ((pkg, version)), rules_here in rules_so_far.items():
             if not rules_here:
                 continue
             path = overrides_folder / "overrides" / pkg / version / f"rules.toml"
             path.parent.mkdir(exist_ok=True, parents=True)
             rules_here = {k: rules_here[k] for k in sorted(rules_here.keys())}
             toml.dump(rules_here, path.open("w"))
-            write_combined_rules(path.with_name("default.nix"), rules_here)
+            requires_nixpkgs_master |= write_combined_rules(path.with_name("default.nix"), rules_here)
         collect_overwrites(overrides_folder)
-        return any_applied
+        return any_applied, requires_nixpkgs_master
 
 
 def collect_overwrites(overrides_folder):
@@ -413,10 +584,22 @@ def get_parser():
         help="Use a different folder for the cloned overrides (allowing for multiple builds)",
     )
     p.add_argument(
+        "-m",
+        "--manual-overrides-source-folder",
+        action="store",
+        help="Rsync manual overrides from this folder before running",
+    )
+    p.add_argument(
         "-p",
         "--python-version",
         action="store",
-        help="python to use. Default 3.12",
+        help="python to use. Default to 'newest at time of package release'",
+    )
+    p.add_argument(
+        "-c",
+        "--cache-folder",
+        action="store",
+        help="Cache folder to store pypi lookups etc. Defaults to .uv2nix_hammer_cache",
     )
 
     return p
@@ -433,6 +616,8 @@ def extract_sources(src_folder, failures):
         elif src.endswith(".zip"):
             with zipfile.ZipFile(src) as zf:
                 zf.extractall(src_folder / pkg / version)
+        elif src.endswith(".whl"):
+            pass
         else:
             log.warn(f"Unknown archive type, not unpacked {src}")
 
@@ -443,7 +628,8 @@ def main():
 
     overrides_source = "https://github.com/TyberiusPrime/uv2nix_hammer_overrides"
     uv2nix = "github:/adisbladis/uv2nix"
-    uv2nix = "/home/finkernagel/upstream/uvdev/uv2nix"
+
+    cache_folder = Path(args.cache_folder or ".uv2nix_hammer_cache")
 
     if args.rewrite:
         target_pkg = args.target_pkg
@@ -451,12 +637,16 @@ def main():
     else:
         target_pkg = args.target_pkg
         if not target_pkg:
-            raise ValueError("non-rewrite needs target_pkg")
+            # raise ValueError("non-rewrite needs target_pkg")
+            get_parser().print_help()
+            sys.exit(1)
         target_pkg_version = args.target_pkg_version
         target_pkg_version, had_src = verify_target_on_pypi(
-            target_pkg, target_pkg_version
+            target_pkg, target_pkg_version, cache_folder
         )
-        target_folder = Path(f"hammer_build_{target_pkg}_{target_pkg_version}")
+        target_folder = Path(
+            f"hammer_build_{normalize_python_package_name(target_pkg)}_{target_pkg_version}"
+        )
         target_folder.mkdir(exist_ok=True)
         project_folder = target_folder / "build"
         src_folder = target_folder / "src"
@@ -465,7 +655,9 @@ def main():
             log.info(f"Using overrides_folder {overrides_folder}")
         else:
             overrides_folder = target_folder / "overrides"
-        python_version = args.python_version or "3.12"
+        python_version = args.python_version or newest_python_at_pkg_release(
+            target_pkg, target_pkg_version, cache_folder
+        )
 
     # clone th overrides repo
     if not overrides_folder.exists():
@@ -478,6 +670,17 @@ def main():
         subprocess.run(
             ["git", "switch", "-c", f"{target_pkg}-{target_pkg_version}"],
             cwd=overrides_folder,
+        )
+    rules.manual_rule_path = overrides_folder / "manual_overrides"
+    if args.manual_overrides_source_folder:
+        subprocess.check_call(
+            [
+                "rsync",
+                args.manual_overrides_source_folder,
+                rules.manual_rule_path,
+                rules.manual_rule_path,
+                "-rP",
+            ]
         )
 
     if args.rewrite:
@@ -532,9 +735,18 @@ def main():
         max_trials = 10
         success = False
         failures = []
-        while max_trials > 0:
+        attempt_no = 0
+        while attempt_no < max_trials:
             try:
-                run_no = attempt_build(project_folder)
+                run_no = attempt_build(project_folder, attempt_no)
+            except InfiniteRecursionError:
+                if attempt_no == 0:
+                    new_rules = try_to_fix_infinite_recursion(project_folder)
+                    write_rules(True, new_rules, overrides_folder)
+                    attempt_no += 1
+                    continue
+                else:
+                    raise
             except ValueError:
                 console.print_exception(show_locals=True)
                 break
@@ -545,11 +757,19 @@ def main():
             any_applied, new_rules = apply_rules(
                 project_folder, overrides_folder, failures
             )
-            write_rules(any_applied, new_rules, overrides_folder)
+            requires_nixpkgs_master = write_rules(any_applied, new_rules, overrides_folder)
             if not any_applied:
                 # we had nothing left to try.
                 break
-            max_trials -= 1
+            if requires_nixpkgs_master:
+                write_flake_nix(
+                    project_folder,
+                    uv2nix,
+                    overrides_folder,
+                    python_version,
+                    "master",
+                )
+            attempt_no += 1
         if success:
             subprocess.run(
                 [
@@ -576,7 +796,7 @@ def main():
                 log.info("No changes were necessary")
             else:
                 log.info(
-                    "Check out the (commited) overrides in {overrides_folder} using `git diff HEAD~1 HEAD`"
+                    f"Check out the (commited) overrides in {overrides_folder} using `git diff HEAD~1 HEAD`"
                 )
         else:
             extract_sources(src_folder, failures)
@@ -591,3 +811,19 @@ def main():
             else:
                 log.info("we gave up because we had no further rules")
             sys.exit(1)
+
+
+def find_cycles_in_uv_lock(path):
+    input = toml.loads((Path(path) / "uv.lock").read_text())
+    g = networkx.DiGraph()
+    for package in input["package"]:
+        for dep in package.get("dependencies", []):
+            g.add_edge(dep["name"], package["name"])
+    return networkx.find_cycle(g)
+
+
+def main_find_infinite_recursion():
+    """Attempt to find cycles in the dependency graphin uv.lock"""
+    import networkx
+
+    print(find_cycles_in_uv_lock("."))

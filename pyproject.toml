@@ -5,6 +5,7 @@ description = "A tool to automatically derive uv2nix compatible overrides by rea
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "networkx>=3.3",
     "packaging>=24.1",
     "rich>=13.8.0",
     "toml>=0.10.2",
@@ -13,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 uv2nix-hammer = "uv2nix_hammer:main"
+uv2nix-hammer-infinite-recursion-spotter = "uv2nix_hammer:main_find_infinite_recursion"
 
 [build-system]
 requires = ["hatchling"]

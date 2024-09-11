@@ -16,6 +16,10 @@ def nix_path(path):
 def nix_literal(path):
     return "~literal:!:" + path
 
+def wrapped_nix_literal(path):
+    return "~literal:!:(" + path + ")"
+
+
 
 def nix_format(value):
     if isinstance(value, str):
@@ -28,13 +32,13 @@ def nix_format(value):
                 return "''" + value.replace("''", "'''") + "''"
             else:
                 return '"' + value.replace('"', '\\"') + '"'
-    elif isinstance(value, (int, float)):
-        return str(value)
     elif isinstance(value, bool):
         if value:
             return 'true'
         else:
             return 'false'
+    elif isinstance(value, (int, float)):
+        return str(value)
     elif isinstance(value, list):
         return "[" + " ".join((nix_format(x) for x in value)) + "]"
     else:
