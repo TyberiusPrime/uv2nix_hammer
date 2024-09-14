@@ -2,6 +2,7 @@ import tarfile
 import urllib3
 import logging
 import zipfile
+import re
 import toml
 import json
 import subprocess
@@ -26,26 +27,38 @@ def drv_to_pkg_and_version(drv):
 
 
 def extract_pyproject_toml_from_archive(src_path):
+    return toml.loads(search_and_extract_from_archive(src_path, "pyproject.toml"))
+
+
+def search_and_extract_from_archive(src_path, filename):
+    """Read a file from archive and return it's contents.
+
+    Searchs for the file in arbitrary sub folders,
+    the one with the shortest overall name is used"""
+
     if src_path.endswith(".tar.gz"):
         tf = tarfile.open(src_path, "r:gz")
         candidates = []
         for fn in tf.getnames():
-            if fn.endswith("pyproject.toml"):
+            if fn.endswith(filename):
                 candidates.append(fn)
         candidates.sort(key=lambda x: len(x))
         if not candidates:
-            raise ValueError("no pyproject.toml")
+            raise KeyError(f"no {filename}")
+        log.debug(f"Found {candidates[0]} for {filename}")
         with tf.extractfile(candidates[0]) as f:
-            return toml.loads(f.read().decode("utf-8"))
+            return f.read().decode("utf-8")
     elif src_path.endswith(".zip"):
+        # todo: should we not seacrh in this as well?
         with zipfile.ZipFile(src_path) as zf:
             try:
-                with zf.open("pyproject.toml") as f:
-                    return toml.loads(f.read().decode("utf-8"))
+                with zf.open(filename) as f:
+                    return f.read().decode("utf-8")
             except KeyError:
-                raise ValueError("no pyproject.toml")
+                raise KeyError(f"no {filename}")
     else:
         raise ValueError("not an archive")
+
 
 def has_pyproject_toml(drv):
     src = get_src(drv)
@@ -74,18 +87,28 @@ class RuleOutput:
         arguments=[],
         src_attrset_parts={},
         wheel_attrset_parts={},
-        requires_nixpkgs_master = False
+        requires_nixpkgs_master=False,
+        dep_constraints=None,
+        python_downgrade=None,
     ):
         self.build_inputs = build_inputs
         self.arguments = arguments
         self.src_attrset_parts = src_attrset_parts
         self.wheel_attrset_parts = wheel_attrset_parts
         self.requires_nixpkgs_master = requires_nixpkgs_master
+        self.dep_constraints = dep_constraints
+        self.python_downgrade = python_downgrade
+
 
 class RuleFunctionOutput:
-    def __init__(self, nix_func):
+    def __init__(self, nix_func, args = []):
         self.inner = nix_func
+        self.args = args
 
+
+class RuleOutputTriggerExclusion:
+    def __init__(self, reason):
+        self.reason = reason
 
 
 class Rule:  # marker class for rules
@@ -107,4 +130,4 @@ def get_release_date(pkg, version):
 
 
 def normalize_python_package_name(pkg):
-    return pkg.lower().replace("_","-")
+    return re.sub(r"[-_.]+", "-", pkg).lower()

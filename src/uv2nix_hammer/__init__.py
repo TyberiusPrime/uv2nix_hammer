@@ -21,6 +21,7 @@ from .helpers import (
     RuleOutput,
     normalize_python_package_name,
     RuleFunctionOutput,
+    RuleOutputTriggerExclusion,
 )
 
 import rich.traceback
@@ -60,6 +61,7 @@ def write_flake_nix(
     python_version,
     nixpkgs_version="24.05",
 ):
+    log.debug("Writing flake")
     flatpythonver = python_version.replace(".", "")
     (folder / "flake.nix").write_text(f"""
 {{
@@ -112,7 +114,15 @@ def write_flake_nix(
 
 
 def uv_lock(folder):
-    subprocess.check_call(["uv", "lock", "--no-cache"], cwd=folder)
+    subprocess.check_call(
+        [
+            "uv",
+            "lock",
+            "--no-cache",
+            "--prerelease=allow",
+        ],
+        cwd=folder,
+    )
 
 
 def wrapped_version(x):
@@ -165,7 +175,10 @@ def verify_target_on_pypi(pkg, version, cache_folder):
         if value.get("url").endswith(".tar.gz"):
             had_src = True
             break
-    return version, had_src
+    import pprint
+    pprint.pprint(info)
+    name = info['info']['name'] # the prefered spelling
+    return name, version, had_src
 
 
 def get_python_release_dates(cache_folder):
@@ -223,7 +236,7 @@ def try_to_fix_infinite_recursion(project_folder):
     # let's see if there's a loop in uv.lock
     # and if there is, add a rule to remove it?
 
-    raise ValueError("TODO")
+    raise ValueError("TODO")  # once I know how to fix this
     cycles = find_cycles_in_uv_lock(project_folder)
     log.debug("Detected infinite recursion")
     if not cycles:
@@ -264,7 +277,7 @@ def attempt_build(project_folder, attempt_no):
         stderr=subprocess.PIPE,
     )
     subprocess.run(
-        ["nix", "build", "--keep-going"],
+        ["nix", "build", "--keep-going", "--max-jobs", "auto", "--cores", "0"],
         cwd=project_folder,
         stderr=(project_folder / f"run_{attempt_no}.log").open("w"),
     )
@@ -309,7 +322,11 @@ def load_existing_rules(overrides_folder, pkg, pkg_version):
         return {}
 
 
-def write_combined_rules(path, rules_to_combine):
+class NeedsExclusion(Exception):
+    pass
+
+
+def write_combined_rules(path, rules_to_combine, project_folder):
     from .nix_format import nix_format, nix_literal, wrapped_nix_literal
 
     function_arguments = set()
@@ -318,15 +335,22 @@ def write_combined_rules(path, rules_to_combine):
     pkg_build_inputs = set()
     further_funcs = []
     requires_nixpkgs_master = False
+    dep_constraints = {}
+    python_downgrade = None
 
     for rule_name in rules_to_combine.keys():
         rule = getattr(rules, rule_name)
         rule_output = rule.apply(rules_to_combine[rule_name])
         if isinstance(rule_output, RuleFunctionOutput):
-            for arg in ["pkgs", "prev", "final"]:
+            function_arguments.add("pkgs")  # needed for the pipe
+            for arg in ["pkgs", "prev", "final", "helpers"]:
                 if f"{arg}." in rule_output.inner:
                     function_arguments.add(arg)
+            function_arguments.update(rule_output.args)
             further_funcs.append("old:" + rule_output.inner)
+        elif isinstance(rule_output, RuleOutputTriggerExclusion):
+            log.info("Triggered exclusion")
+            raise NeedsExclusion(rule_output.reason)
 
         elif isinstance(rule_output, RuleOutput):
             pkg_build_inputs.update(rule_output.build_inputs)
@@ -341,15 +365,26 @@ def write_combined_rules(path, rules_to_combine):
                         if not k in dest:
                             dest[k] = [nix_literal('old.postPatch or ""')]
                         dest[k] += [v]
-                    elif k == "nativeBuildInputs" or k == "buildInputs":
+                    elif k == "nativeBuildInputs" or k == "uildInputs":
                         dest[k] = sorted(set(dest.get(k, []) + v))
                     elif not k in dest:
                         dest[k] = v
                     else:
                         raise ValueError(f"Think up a merge strategy for {k}")
             if rule_output.requires_nixpkgs_master:
-                log.debug(f"Enabled nixpkgs master because of rule {rule_name} - {path}")
+                log.debug(
+                    f"Enabled nixpkgs master because of rule {rule_name} - {path}"
+                )
                 requires_nixpkgs_master = True
+            if rule_output.dep_constraints:
+                for k, v in rule_output.dep_constraints.items():
+                    if k in dep_constraints and v != dep_constraints[k]:
+                        raise ValueError("Dep conflict, think up a merge strategy")
+                    dep_constraints[k] = v
+            if rule_output.python_downgrade:
+                if python_downgrade and python_downgrade != rule_output.python_downgrade:
+                    raise ValueError("Conflicting python downgrades")
+                python_downgrade = rule_output.python_downgrade
         else:
             raise ValueError(
                 f"rule's apply output was not a RuleOutput or RuleFunctionOutput)"
@@ -391,6 +426,10 @@ def write_combined_rules(path, rules_to_combine):
                 ("(" + nix_format(x) + ")" for x in src_attrset_parts["postPatch"])
             )
         )
+
+    if "env" in src_attrset_parts and not src_attrset_parts["env"]:
+        del src_attrset_parts["env"]
+
     src_body = nix_format(src_attrset_parts)
     wheel_body = nix_format(wheel_attrset_parts)
     funcs = []
@@ -399,15 +438,11 @@ def write_combined_rules(path, rules_to_combine):
             f"""old: if ((old.format or "sdist") == "wheel") then {wheel_body} else {src_body}"""
         )
     funcs.extend(further_funcs)
-    if function_arguments:
-        head = f"{{{", ".join(function_arguments)}, ...}}"
-    else:
-        head = "{...}"
     if len(funcs) == 1:
         out_body = f"""
-        {head}: {funcs[0]}
+        : {funcs[0]}
         """
-    else:
+    elif len(funcs) > 0:
         str_funcs = nix_format(
             [
                 wrapped_nix_literal(f.replace("old:", "old: old // (") + ")")
@@ -417,25 +452,66 @@ def write_combined_rules(path, rules_to_combine):
         function_arguments.add("pkgs")
 
         out_body = f"""
-        {head}: 
-            old: 
+        :
+            old:
             let funcs = {str_funcs};
-            in 
+            in
             pkgs.lib.trivial.pipe old funcs
     """
+    else:
+        out_body = False
+    if out_body: # no need to write a default.nix if all we did was downgrade pytohn or such
+        if function_arguments:
+            head = f"{{{", ".join(function_arguments)}, ...}}"
+        else:
+            head = "{...}"
 
-    path.write_text(out_body)
-    p = subprocess.Popen(
-        ["nix", "fmt", str(path.absolute())],
-        cwd=path.parent.parent.parent,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        path.write_text(head + out_body)
+        p = subprocess.Popen(
+            ["nix", "fmt", str(path.absolute())],
+            cwd=path.parent.parent.parent,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stdout, stderr = p.communicate()
+        if p.returncode != 0:
+            print(stderr)
+            raise ValueError(f"nix fmt failed {path.absolute()}")
+
+    if dep_constraints:
+        extend_pyproject_toml_with_dep_constraints(
+            dep_constraints, project_folder / "pyproject.toml"
+        )
+    if python_downgrade:
+        downgrade_python(python_downgrade, project_folder / "pyproject.toml")
+
+    return requires_nixpkgs_master, python_downgrade
+
+
+def extend_pyproject_toml_with_dep_constraints(dep_constraints, pyproject_toml_path):
+    input = toml.loads(pyproject_toml_path.read_text())
+    for k, v in dep_constraints.items():
+        input["project"]["dependencies"].append(f"{k}{v}")
+    pyproject_toml_path.write_text(toml.dumps(input))
+    uv_lock(
+        pyproject_toml_path.parent,
     )
-    stdout, stderr = p.communicate()
-    if p.returncode != 0:
-        print(stderr)
-        raise ValueError(f"nix fmt failed {path.absolute()}")
-    return requires_nixpkgs_master
+
+def downgrade_python(python_version, pyproject_toml_path):
+    log.warn(f"Downgrading to python {python_version}")
+    input = toml.loads(pyproject_toml_path.read_text())
+    input['project']['requires-python'] = f"~={python_version}"
+    pyproject_toml_path.write_text(toml.dumps(input))
+    uv_lock(
+        pyproject_toml_path.parent,
+    )
+    # flake_input = pyproject_toml_path.with_name('flake.nix').read_text()
+    # flat_py_version = python_version.replace(".", "")
+    # flake_output = flake_input.replace('pkgs.python312',
+    #                                  f'pkgs.python{flat_py_version}')
+    # assert flake_input != flake_output
+    # pyproject_toml_path.with_name('flake.nix').write_text(flake_output)
+
 
 
 def check_for_wheel_build(drv):
@@ -450,7 +526,8 @@ def copy_if_non_value(value):
         return value
 
 
-def apply_rules(project_folder, overrides_folder, failures):
+def detect_rules(project_folder, overrides_folder, failures):
+    """Check which rules we can apply"""
     log.debug(f"Applying rules to {len(failures)} failures")
     any_applied = False
     rules_so_far = {}
@@ -462,7 +539,7 @@ def apply_rules(project_folder, overrides_folder, failures):
             "bootstrap-build",
         ):
             log.warn(
-                f"Skipping apply_rules for {pkg_tuple[0]} - we're not going to override that, it needs to bootstrap from nixpkgs"
+                f"Skipping detect_rules for {pkg_tuple[0]} - we're not going to override that, it needs to bootstrap from nixpkgs"
             )
             continue
         # is_wheel = check_for_wheel_build(drv)
@@ -476,20 +553,32 @@ def apply_rules(project_folder, overrides_folder, failures):
             ):
                 # log.debug(f"checking rule {rule_name} in {pkg_tuple}")
                 old_opts = rules_here.get(rule_name)
-                if opts := rule.match(drv, drv_log, copy_if_non_value(old_opts)):
+                if opts := rule.match(
+                    drv, drv_log, copy_if_non_value(old_opts), rules_here.copy()
+                ):
                     rules_here[rule_name] = opts
                     if opts != old_opts:
                         any_applied = True
-                        log.debug(
+                        log.info(
                             f"Rule hit! {rule_name} in {pkg_tuple}}}. Now: {opts} - was: {old_opts}"
                         )
+                        if hasattr(rule, "extract"):
+                            rule.extract(
+                                drv,
+                                overrides_folder
+                                / "overrides"
+                                / pkg_tuple[0]
+                                / pkg_tuple[1],
+                            )
+
         rules_so_far[pkg_tuple] = rules_here
 
     return any_applied, rules_so_far
 
 
-def write_rules(any_applied, rules_so_far, overrides_folder):
+def write_rules(any_applied, rules_so_far, overrides_folder, project_folder):
     requires_nixpkgs_master = False
+    python_downgrade = None
     if any_applied:  # todo move up...
         for ((pkg, version)), rules_here in rules_so_far.items():
             if not rules_here:
@@ -498,9 +587,32 @@ def write_rules(any_applied, rules_so_far, overrides_folder):
             path.parent.mkdir(exist_ok=True, parents=True)
             rules_here = {k: rules_here[k] for k in sorted(rules_here.keys())}
             toml.dump(rules_here, path.open("w"))
-            requires_nixpkgs_master |= write_combined_rules(path.with_name("default.nix"), rules_here)
+            _requires_nixpkgs_master, python_downgrade = write_combined_rules(
+                path.with_name("default.nix"), rules_here, project_folder
+            )
+            requires_nixpkgs_master |= _requires_nixpkgs_master
+
         collect_overwrites(overrides_folder)
-        return any_applied, requires_nixpkgs_master
+        # we have to commit every time for nix > 2.23 or such
+        # see https://github.com/NixOS/nix/issues/11181
+        subprocess.run(
+            [
+                "git",
+                "add",
+                ".",
+            ],
+            cwd=overrides_folder,
+        )
+        subprocess.run(
+            [
+                "git",
+                "commit",
+                "-m",
+                f"autogenerated overwrites (commit to be squashed)",
+            ],
+            cwd=overrides_folder,
+        )
+    return requires_nixpkgs_master, python_downgrade
 
 
 def collect_overwrites(overrides_folder):
@@ -587,7 +699,7 @@ def get_parser():
         "-m",
         "--manual-overrides-source-folder",
         action="store",
-        help="Rsync manual overrides from this folder before running",
+        help="Rsync manual overrides from this folder before running (not top level, manual_overrides!)",
     )
     p.add_argument(
         "-p",
@@ -641,7 +753,7 @@ def main():
             get_parser().print_help()
             sys.exit(1)
         target_pkg_version = args.target_pkg_version
-        target_pkg_version, had_src = verify_target_on_pypi(
+        target_pkg, target_pkg_version, had_src = verify_target_on_pypi(
             target_pkg, target_pkg_version, cache_folder
         )
         target_folder = Path(
@@ -673,13 +785,27 @@ def main():
         )
     rules.manual_rule_path = overrides_folder / "manual_overrides"
     if args.manual_overrides_source_folder:
+        if (Path(args.manual_overrides_source_folder) / "manual_overrides").exists():
+            p = Path(args.manual_overrides_source_folder) / "manual_overrides"
+        else:
+            p = Path(args.manual_overrides_source_folder)
+        assert p.name == "manual_overrides"
+        print(
+            [
+                "rsync",
+                str(p),
+                overrides_folder,
+                "-r",
+                "--info=progress2",
+            ]
+        )
         subprocess.check_call(
             [
                 "rsync",
-                args.manual_overrides_source_folder,
-                rules.manual_rule_path,
-                rules.manual_rule_path,
-                "-rP",
+                str(p),
+                overrides_folder,
+                "-r",
+                "--info=progress2",
             ]
         )
 
@@ -736,40 +862,46 @@ def main():
         success = False
         failures = []
         attempt_no = 0
-        while attempt_no < max_trials:
-            try:
-                run_no = attempt_build(project_folder, attempt_no)
-            except InfiniteRecursionError:
-                if attempt_no == 0:
-                    new_rules = try_to_fix_infinite_recursion(project_folder)
-                    write_rules(True, new_rules, overrides_folder)
-                    attempt_no += 1
-                    continue
-                else:
-                    raise
-            except ValueError:
-                console.print_exception(show_locals=True)
-                break
-            if (project_folder / "result").exists():
-                success = True
-                break
-            failures = load_failures(project_folder, run_no)
-            any_applied, new_rules = apply_rules(
-                project_folder, overrides_folder, failures
-            )
-            requires_nixpkgs_master = write_rules(any_applied, new_rules, overrides_folder)
-            if not any_applied:
-                # we had nothing left to try.
-                break
-            if requires_nixpkgs_master:
-                write_flake_nix(
-                    project_folder,
-                    uv2nix,
-                    overrides_folder,
-                    python_version,
-                    "master",
+        try:
+            while attempt_no < max_trials:
+                try:
+                    run_no = attempt_build(project_folder, attempt_no)
+                except InfiniteRecursionError:
+                    if attempt_no == 0:
+                        new_rules = try_to_fix_infinite_recursion(project_folder)
+                        write_rules(True, new_rules, overrides_folder, project_folder)
+                        attempt_no += 1
+                        continue
+                    else:
+                        raise
+                except ValueError:
+                    console.print_exception(show_locals=True)
+                    break
+                if (project_folder / "result").exists():
+                    success = True
+                    break
+                failures = load_failures(project_folder, run_no)
+                any_applied, new_rules = detect_rules(
+                    project_folder, overrides_folder, failures
                 )
-            attempt_no += 1
+                requires_nixpkgs_master, python_downgrade= write_rules(
+                    any_applied, new_rules, overrides_folder, project_folder
+                )
+                if not any_applied:
+                    # we had nothing left to try.
+                    break
+                if requires_nixpkgs_master or python_downgrade:
+                    write_flake_nix(
+                        project_folder,
+                        uv2nix,
+                        overrides_folder,
+                        python_version if not python_downgrade else python_downgrade,
+                        "master",
+                    )
+                attempt_no += 1
+        except NeedsExclusion:
+            raise  # the helper will read it.
+
         if success:
             subprocess.run(
                 [
@@ -795,6 +927,30 @@ def main():
             if "main" in head_branches:
                 log.info("No changes were necessary")
             else:
+                # squash the commits down to a single one
+                # non interactive!
+                head_rev = (
+                    subprocess.check_output(
+                        ["git", "merge-base", "main", "HEAD"],
+                        cwd=overrides_folder,
+                    )
+                    .decode()
+                    .strip()
+                )
+                subprocess.check_call(
+                    ["git", "reset", head_rev, "--soft"], cwd=overrides_folder
+                )
+                # now commit
+                subprocess.check_call(
+                    [
+                        "git",
+                        "commit",
+                        "-m",
+                        f"autogenerated overwrites for {target_pkg}=={target_pkg_version}",
+                    ],
+                    cwd=overrides_folder,
+                )
+
                 log.info(
                     f"Check out the (commited) overrides in {overrides_folder} using `git diff HEAD~1 HEAD`"
                 )

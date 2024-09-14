@@ -16,7 +16,7 @@
     formatter = eachSystem (pkgs: treefmtEval.${pkgs.system}.config.build.wrapper);
     devShell = eachSystem (pkgs:
       pkgs.mkShell {
-        buildInputs = [pkgs.uv (pkgs.python312.withPackages (p: [p.rich p.packaging p.toml p.urllib3]))];
+        buildInputs = [pkgs.uv pkgs.rsync (pkgs.python312.withPackages (p: [p.rich p.packaging p.toml p.urllib3]))];
       });
   };
 }

@@ -1,11 +1,14 @@
+from os import stat
 import re
 from .helpers import (
     extract_pyproject_toml_from_archive,
+    search_and_extract_from_archive,
     has_pyproject_toml,
     get_src,
     log,
     RuleOutput,
     RuleFunctionOutput,
+    RuleOutputTriggerExclusion,
     Rule,
     drv_to_pkg_and_version,
     get_release_date,
@@ -28,7 +31,7 @@ class BuildSystems(Rule):
         return bs.lower().strip()
 
     @classmethod
-    def match(cls, drv, drv_log, opts):
+    def match(cls, drv, drv_log, opts, _rules_here):
         # the cython3 thing is a debacle.
         if opts and "cython" in opts:  # -> we already tried it with cython3
             pkg, version = drv_to_pkg_and_version(drv)
@@ -72,7 +75,7 @@ class BuildSystems(Rule):
                     ]
                     opts = [x for x in opts if not x in filtered_build_systems]
                     log.debug(f"\tfound build-systems: {opts}")
-                except ValueError:
+                except KeyError:
                     opts = []
             except ValueError:
                 opts = []  # was a wheel
@@ -85,10 +88,10 @@ class BuildSystems(Rule):
             opts.append("cython_0")
         if "Missing dependencies:" in drv_log:
             # log.error(f"Missing dependencies - {drv}")
-            if "setuptools-scm" in drv_log:
+            if "setuptools-scm" in drv_log or "setuptools_scm" in drv_log:
                 opts.append("setuptools-scm")
-            if "setuptools_scm" in drv_log:
-                opts.append("setuptools-scm")
+            if "setuptools-git" in drv_log or "setuptools_git" in drv_log:
+                opts.append("setuptools-git")
             if "pytest-runner" in drv_log:
                 opts.append("pytest-runner")
             if "pycodestyle" in drv_log:
@@ -97,6 +100,10 @@ class BuildSystems(Rule):
                 opts.append("isort")
             if "cython" in drv_log:
                 opts.append("cython")
+            if "pkgconfig" in drv_log:
+                opts.append("pkgconfig")
+            if "pip" in drv_log:
+                opts.append("pip")
         if (
             "Cython.Compiler.Errors.CompileError:" in drv_log
             and not "cython" in opts
@@ -118,7 +125,7 @@ class BuildSystems(Rule):
 
 class PoetryMasonry(Rule):
     @staticmethod
-    def match(drv, drv_log, opts):
+    def match(drv, drv_log, opts, _rules_here):
         return "ModuleNotFoundError: No module named 'poetry.masonry'" in drv_log
 
     @staticmethod
@@ -134,12 +141,12 @@ class PoetryMasonry(Rule):
 
 class TomlRequiresPatcher(Rule):
     @staticmethod
-    def match(drv, drv_log, opts):
+    def match(drv, drv_log, opts, _rules_here):
         if "Missing dependencies:" in drv_log and has_pyproject_toml(drv):
             start = drv_log[drv_log.find("Missing dependencies:") :]
             next_line = start[start.find("\n") + 1 :]
             next_line = next_line[: next_line.find("\n")]
-            return [(x in next_line for x in requirements_sep_chars)]
+            return [x in next_line for x in requirements_sep_chars]
 
     @staticmethod
     def apply(opts):
@@ -155,12 +162,13 @@ class TomlRequiresPatcher(Rule):
 
 class NativeBuildInputs(Rule):
     @staticmethod
-    def match(drv, drv_log, opts):
+    def match(drv, drv_log, opts, _rules_here):
         if opts is None:
             opts = []
         for q, vs in [
             ("No such file or directory: 'gfortran'", "gfortran"),
             ("Did not find pkg-config", "pkg-config"),
+            ("No such file or directory: 'pkg-config'", "pkg-config"),
             (
                 "The headers or library files could not be found for zlib",
                 ["zlib.dev", "pkg-config"],
@@ -173,31 +181,62 @@ class NativeBuildInputs(Rule):
             ("systemd/sd-daemon.h: No such file", "pkg-config"),  # cysystemd
             ("cython<1.0.0,>=0.29", "final.cython_0"),
             ("ModuleNotFoundError: No module named 'mesonpy", "meson"),
+            # setuptools should have been handled by BuildSystems,
+            # so something else must be wrong.
+            # ("ModuleNotFoundError: No module named 'setuptools'", "final.setuptools"),
             ("gobject-introspection-1.0 found: NO", "gobject-introspection"),
             ("did not manage to locate a library called 'augeas'", "pkg-config"),
             ("pkg-config: command not found", "pkg-config"),
+            ("krb5-config", "krb5Full"),
+            ("libpyvex.so -> not found!", "final.pyvex"),
+            ('#include "cairo.h"', ["pkgs.cairo.dev", "pkg-config"]),
+            (
+                "Specify MYSQLCLIENT_CFLAGS and MYSQLCLIENT_LDFLAGS env vars manually",
+                "libmysqlclient",
+            ),
+            ("ModuleNotFoundError: No module named 'torch'", "final.torch"),
+            ("ta_defs.h: No such file", "ta-lib"),
+            ("lber.h: No such file", ["openldap.dev", "pkg-config"]),
         ]:
             if q in drv_log:
                 if isinstance(vs, list):
                     opts.extend(
-                        nix_literal(("pkgs." + x) if not "." in x else x) for x in vs
+                        nix_literal(("pkgs." + x) if not "." in x or ".dev" in x else x)
+                        for x in vs
                     )
                 else:
-                    opts.append(nix_literal(("pkgs." + vs) if not "." in vs else vs))
+                    opts.append(
+                        nix_literal(
+                            ("pkgs." + vs) if not "." in vs or ".dev" in vs else vs
+                        )
+                    )
 
         return sorted(set(opts))
 
     @staticmethod
     def apply(opts):
-        src_attrset = {"nativeBuildInputs": opts}
+        src_attrset = {}
+        if nix_literal("pkgs.ta-lib") in opts:
+            src_attrset["env"] = {
+                "TA_INCLUDE_PATH": "${pkgs.ta-lib}/include",
+                "TA_LIBRARY_PATH": "${pkgs.ta-lib}/lib",
+            }
+            if not "cython_0" in opts:
+                opts.append(nix_literal("final.cython_0"))
+
+        src_attrset["nativeBuildInputs"] = opts
         if nix_literal("pkgs.cmake") in opts or "pkgs.meson" in opts:
             src_attrset["dontUseCmakeConfigure"] = True
-        return RuleOutput(arguments=["pkgs"], src_attrset_parts=src_attrset)
+
+        args = sorted(
+            set(x[len("~literal:!:") :].split(".")[0] for x in opts if "." in x)
+        )
+        return RuleOutput(arguments=args, src_attrset_parts=src_attrset)
 
 
 class BuildInputs(Rule):
     @staticmethod
-    def match(drv, drv_log, opts):
+    def match(drv, drv_log, opts, _rules_here):
         if opts is None:
             opts = []
         # if 'Dependency "OpenBLAS" not found,' in drv_log:
@@ -238,6 +277,23 @@ class BuildInputs(Rule):
             ("No package 'libsystemd' found", "systemd"),
             ('Dependency "cairo" not found,', "cairo"),
             ("did not manage to locate a library called 'augeas'", "augeas"),
+            ("libfreetype.so.6 -> not found!", "freetype"),
+            ("libGLU.so.1 -> not found!", "libGLU"),
+            ("liblzma.so.5 -> not found!", "xz"),
+            ("libxml2.so.2 -> not found!", "libxml2"),
+            ("libSDL2-2.0.so.0 -> not found!", "SDL2"),
+            ("alsa/asoundlib.h", "pkgs.alsa-lib"),
+            (
+                "Specify MYSQLCLIENT_CFLAGS and MYSQLCLIENT_LDFLAGS env vars manually",
+                "libmysqlclient",
+            ),
+            ("#include <ev.h>", "libev"),
+            ("Is Open Babel installed?", "openbabel"),
+            ("#include <bluetooth/bluetooth.h>", "bluez"),
+            (" #include <boost/optional.hpp>", "boost"),
+            ("/poppler-document.h: No such", "poppler"),
+            ("Could not find required package: opencv.", "opencv4"),
+            # (" RequiredDependencyException: pangocairo", "pango"),
         ]:
             if k in drv_log:
                 opts.append(nix_literal(f"pkgs.{pkg}"))
@@ -253,12 +309,15 @@ class BuildInputs(Rule):
             }
         else:
             env = {}
+        needs_master = nix_literal("pkgs.cudaPackages.cudnn") in opts
+        if needs_master:
+            log.debug("Switching to master because of cuda")
         return RuleOutput(
             arguments=["pkgs"],
             src_attrset_parts={"buildInputs": opts, "env": env},
             wheel_attrset_parts={"buildInputs": opts},
             # nixpkgs 24.05 has no cudnn 9.x
-            requires_nixpkgs_master="pkgs.cudaPackages.cudnn" in opts,
+            requires_nixpkgs_master=needs_master,
         )
 
 
@@ -267,13 +326,15 @@ manual_rule_path = None  # set from outside
 
 class ManualOverrides(Rule):
     @staticmethod
-    def match(drv, drv_log, opts):
+    def match(drv, drv_log, opts, _rules_here):
         pkg, version = drv_to_pkg_and_version(drv)
         if pkg == "pillow":
             return "pillow"
         # no need for version searching here. If you need to reuse the rules for other versions
         # drop a symlink.
-        log.debug(f"Looking for {(manual_rule_path / pkg / version / 'default.nix')}")
+        log.debug(
+            f"Manual path would be {(manual_rule_path / pkg / version / 'default.nix')}"
+        )
         if (manual_rule_path / pkg / version / "default.nix").exists():
             return "__file__:" + pkg + "/" + version + "/default.nix"
         return None
@@ -298,7 +359,7 @@ class ManualOverrides(Rule):
 
 class MissingEmptyFiles(Rule):
     @staticmethod
-    def match(drv, drv_log, opts):
+    def match(drv, drv_log, opts, _rules_here):
         if hits := re.findall(
             "No such file or directory: '([^']*(requirements.txt))'", drv_log
         ):
@@ -315,7 +376,7 @@ class MissingEmptyFiles(Rule):
 
 class VersioneerBitRot(Rule):
     @staticmethod
-    def match(drv, drv_log, opts):
+    def match(drv, drv_log, opts, _rules_here):
         if "module 'configparser' has no attribute 'SafeConfigParser'." in drv_log:
             return True
 
@@ -340,7 +401,7 @@ class VersioneerBitRot(Rule):
 
 class RemovePropagatedBuildInputs(Rule):
     @staticmethod
-    def match(drv, drv_log, opts):
+    def match(drv, drv_log, opts, _rules_here):
         pass
 
     @staticmethod
@@ -366,7 +427,7 @@ class RemovePropagatedBuildInputs(Rule):
 
 class RefindBuildDirectory(Rule):
     @staticmethod
-    def match(drv, drv_log, opts):
+    def match(drv, drv_log, opts, _rules_here):
         return (
             "does not appear to be a Python project: no pyproject.toml or setup.py"
             in drv_log
@@ -386,7 +447,7 @@ class RefindBuildDirectory(Rule):
 
 class Torch(Rule):
     @staticmethod
-    def match(drv, drv_log, opts):
+    def match(drv, drv_log, opts, _rules_here):
         return "libc10_cuda.so -> not found!" in drv_log
 
     @staticmethod
@@ -401,3 +462,119 @@ class Torch(Rule):
         ''"""),
             },  # will fail if there's multiple directories
         )
+
+
+class DowngradeNumpy(Rule):
+    """Downgrade numpy when it's a clear >= 2.0 not suppported case"""
+
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        return (
+            "'int_t' is not a type identifier" in drv_log and "np.int_t" in drv_log
+        )  # or ("numpy/arrayobject.h: No such file" in drv_log)
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutput(dep_constraints={"numpy": "<2"})
+
+
+class DowngradePython(Rule):
+    """Downgrade numpy when it's a clear >= 2.0 not suppported case"""
+
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        if "3.12" in drv_log and "No module named 'distutils'" in drv_log:
+            return "3.11"
+        if "greenlet-1.1.0" in drv_log:
+            return "3.10"
+
+    @staticmethod
+    def apply(opts):
+        log.debug(f"Downgrading to python {opts}")
+        return RuleOutput(python_downgrade=opts)
+
+
+class IsPython2Only(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        if "is Python 2 only." in drv_log:
+            pkg_tuple = drv_to_pkg_and_version(drv)
+            return f"Is_python2_only: {pkg_tuple}"
+        if (
+            "PyFloat_FromString(str, NULL);" in drv_log
+        ):  # points to a long long ago c api.
+            pkg_tuple = drv_to_pkg_and_version(drv)
+            return f"Is_python2_only (from c code): {pkg_tuple}"
+        if "NameError: name 'execfile' is not defined" in drv_log:
+            pkg_tuple = drv_to_pkg_and_version(drv)
+            return f"Is_python2_only (uses execfile): {pkg_tuple}"
+        if "Missing dependencies" in drv_log and "nose" in drv_log:
+            return f"Is_python2_only (required nose): {drv_to_pkg_and_version(drv)}"
+        if "NameError: name 'file' is not defined" in drv_log:
+            return (
+                f"Is_python2_only (file is not defined): {drv_to_pkg_and_version(drv)}"
+            )
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutputTriggerExclusion(opts)
+
+
+class Rust(Rule):
+    @classmethod
+    def match(cls, drv, drv_log, opts, rules_here):
+        result = None
+        if "setuptools_rust" in drv_log or "setuptools-rust" in rules_here.get(
+            "BuildSystems", []
+        ):
+            result = "setuptools_rust"
+        elif "maturin" in drv_log or "maturin" in rules_here.get("BuildSystems", []):
+            result = "maturin"
+        return result
+
+    @staticmethod
+    def apply(opts):
+        return RuleFunctionOutput("""
+                                  pkgs.lib.optionalAttrs (old.format or "sdist" != "wheel") (helpers.standardMaturin {} old)
+                                  """)
+
+    @staticmethod
+    def extract(drv, target_folder):
+        target_path = target_folder / "Cargo.lock"
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        src = get_src(drv)
+        try:
+            cargo_lock = search_and_extract_from_archive(src, "Cargo.lock")
+        except KeyError:
+            raise ValueError("implement cargo lock builder")
+
+        target_path.write_text(cargo_lock)
+
+
+class Enum34(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        if "module 'enum' has no attribute 'global_enum'" in drv_log:
+            return f"Requires enum34, a pre python 3.6 thing."
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutputTriggerExclusion(opts)
+
+
+class PythonTooNew(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        if "type object 'Callable' has no attribute '_abc_registry'" in drv_log:
+            return f"requires pypi typing, but typing has been built in since 3.6"
+        if "sqlcipher/sqlite3.h:" in drv_log:
+            return f"requires sqlcipher, which is disabled since python 3.9"
+        if "module 'typing' has no attribute '_ClassVar'" in drv_log:
+            return "requires dataclasses from pypi (so python before 3.6)"
+        if "This backport is meant only for Python 2." in drv_log:
+            pkg_tuple = drv_to_pkg_and_version(drv)
+            return "This backport is meant only for Python 2. {pkg_tuple}"
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutputTriggerExclusion(opts)
