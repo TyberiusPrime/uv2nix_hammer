@@ -61,7 +61,7 @@ def write_flake_nix(
     python_version,
     nixpkgs_version="24.05",
 ):
-    log.debug("Writing flake")
+    log.debug(f"Writing flake, python_version={python_version}, nixpkgs={nixpkgs_version}")
     flatpythonver = python_version.replace(".", "")
     (folder / "flake.nix").write_text(f"""
 {{
@@ -95,7 +95,7 @@ def write_flake_nix(
       overlay'' = pyfinal: pyprev: let
         applied = overlay' pyfinal pyprev;
       in
-        lib.filterAttrs (n: _: n != "packaging" && n != "tomli" && n != "pyproject-hooks" && n != "build" && n != "wheel") applied;
+        lib.filterAttrs (n: _: n != "packaging" && n != "tomli" && n != "pyproject-hooks" && n != "build" && n != "wheel" && n!= "pathlib") applied;
 
        overrides = (uv2nix_hammer_overrides.overrides pkgs);
     in
@@ -134,10 +134,10 @@ def wrapped_version(x):
         return Version("0.0.0")
 
 
-def get_pypi_json(pkg, cache_folder):
+def get_pypi_json(pkg, cache_folder, force=False):
     cache_folder.mkdir(exist_ok=True, parents=True)
     fn = cache_folder / f"{pkg}.json"
-    if not fn.exists() or (fn.stat().st_mtime - time.time()) > 60 * 60 * 24:
+    if force or not fn.exists() or (fn.stat().st_mtime - time.time()) > 60 * 60 * 24:
         url = f"https://pypi.org/pypi/{pkg}/json"
         resp = urllib3.request("GET", url)
         fn.write_text(resp.data.decode())
@@ -175,8 +175,6 @@ def verify_target_on_pypi(pkg, version, cache_folder):
         if value.get("url").endswith(".tar.gz"):
             had_src = True
             break
-    import pprint
-    pprint.pprint(info)
     name = info['info']['name'] # the prefered spelling
     return name, version, had_src
 
@@ -198,7 +196,12 @@ def get_python_release_dates(cache_folder):
 def newest_python_at_pkg_release(pkg, version, cache_folder):
     # question 0: what
     info = get_pypi_json(pkg, cache_folder)
-    release = info["releases"][version]
+    try:
+        release = info["releases"][version]
+    except KeyError:
+        info = get_pypi_json(pkg, cache_folder, True)
+        release = info["releases"][version]
+
     try:
         release_date = datetime.datetime.fromisoformat(release[0]["upload_time"]).date()
     except IndexError:
@@ -236,7 +239,7 @@ def try_to_fix_infinite_recursion(project_folder):
     # let's see if there's a loop in uv.lock
     # and if there is, add a rule to remove it?
 
-    raise ValueError("TODO")  # once I know how to fix this
+    #raise ValueError("TODO")  # once I know how to fix this
     cycles = find_cycles_in_uv_lock(project_folder)
     log.debug("Detected infinite recursion")
     if not cycles:
@@ -284,6 +287,8 @@ def attempt_build(project_folder, attempt_no):
     stderr = (project_folder / f"run_{attempt_no}.log").read_text()
     if "infinite recursion encountered" in stderr:
         raise InfiniteRecursionError()
+    if "pathlib was removed " in stderr:
+        raise NeedsExclusion("pathlib was removed in python 3.5")
     if "while evaluating the attribute" in stderr:
         raise ValueError(
             "Generated overwrites were not valid nix code (syntax or semantic)"
@@ -361,11 +366,11 @@ def write_combined_rules(path, rules_to_combine, project_folder):
                 (rule_output.wheel_attrset_parts, wheel_attrset_parts),
             ):
                 for k, v in src.items():
-                    if k == "postPatch":
+                    if k == "postPatch" or k == "preBuild" or k == "preConfigure":
                         if not k in dest:
-                            dest[k] = [nix_literal('old.postPatch or ""')]
+                            dest[k] = [nix_literal(f'old.{k} or ""')]
                         dest[k] += [v]
-                    elif k == "nativeBuildInputs" or k == "uildInputs":
+                    elif k == "nativeBuildInputs" or k == "buildInputs":
                         dest[k] = sorted(set(dest.get(k, []) + v))
                     elif not k in dest:
                         dest[k] = v
@@ -557,7 +562,7 @@ def detect_rules(project_folder, overrides_folder, failures):
                     drv, drv_log, copy_if_non_value(old_opts), rules_here.copy()
                 ):
                     rules_here[rule_name] = opts
-                    if opts != old_opts:
+                    if opts != old_opts or opts and hasattr(rule, 'always_reapply'):
                         any_applied = True
                         log.info(
                             f"Rule hit! {rule_name} in {pkg_tuple}}}. Now: {opts} - was: {old_opts}"
@@ -862,14 +867,24 @@ def main():
         success = False
         failures = []
         attempt_no = 0
+        requires_nixpkgs_master = None
+        python_downgrade = None
         try:
             while attempt_no < max_trials:
+                if requires_nixpkgs_master or python_downgrade:
+                    write_flake_nix(
+                        project_folder,
+                        uv2nix,
+                        overrides_folder,
+                        python_version if not python_downgrade else python_downgrade,
+                        "master",
+                    )
                 try:
                     run_no = attempt_build(project_folder, attempt_no)
                 except InfiniteRecursionError:
                     if attempt_no == 0:
                         new_rules = try_to_fix_infinite_recursion(project_folder)
-                        write_rules(True, new_rules, overrides_folder, project_folder)
+                        requires_nixpkgs_master, python_downgrade = write_rules(True, new_rules, overrides_folder, project_folder)
                         attempt_no += 1
                         continue
                     else:
@@ -890,14 +905,6 @@ def main():
                 if not any_applied:
                     # we had nothing left to try.
                     break
-                if requires_nixpkgs_master or python_downgrade:
-                    write_flake_nix(
-                        project_folder,
-                        uv2nix,
-                        overrides_folder,
-                        python_version if not python_downgrade else python_downgrade,
-                        "master",
-                    )
                 attempt_no += 1
         except NeedsExclusion:
             raise  # the helper will read it.

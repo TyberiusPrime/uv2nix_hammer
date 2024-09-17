@@ -71,7 +71,8 @@ class BuildSystems(Rule):
                         )
                     )
                     filtered_build_systems = [
-                        "hatch-docstring-description"  # not in nixpkgs and useless-for-our-purposes-metadata anyway
+                        "hatch-docstring-description",  # not in nixpkgs and useless-for-our-purposes-metadata anyway
+                        "setuptools-scm-git-archive",  # marked as broken in nixpkgs, plugin is obsolete, setuptools-scm can do it.
                     ]
                     opts = [x for x in opts if not x in filtered_build_systems]
                     log.debug(f"\tfound build-systems: {opts}")
@@ -104,6 +105,8 @@ class BuildSystems(Rule):
                 opts.append("pkgconfig")
             if "pip" in drv_log:
                 opts.append("pip")
+            if "pbr" in drv_log:
+                opts.append("pbr")
         if (
             "Cython.Compiler.Errors.CompileError:" in drv_log
             and not "cython" in opts
@@ -167,6 +170,7 @@ class NativeBuildInputs(Rule):
             opts = []
         for q, vs in [
             ("No such file or directory: 'gfortran'", "gfortran"),
+            ("but no Fortran compiler found", "gfortran"),
             ("Did not find pkg-config", "pkg-config"),
             ("No such file or directory: 'pkg-config'", "pkg-config"),
             (
@@ -177,6 +181,7 @@ class NativeBuildInputs(Rule):
             ("pkg-config is required for building", "pkg-config"),
             ('"pkg-config" command could not be found.', "pkg-config"),
             ("CMake must be installed to build from source.", "cmake"),
+            ("CMake is not installed on your system!", "cmake"),
             ("checking for GTK+ - version >= 3.0.0... no", ["gtk3", "pkg-config"]),
             ("systemd/sd-daemon.h: No such file", "pkg-config"),  # cysystemd
             ("cython<1.0.0,>=0.29", "final.cython_0"),
@@ -187,7 +192,7 @@ class NativeBuildInputs(Rule):
             ("gobject-introspection-1.0 found: NO", "gobject-introspection"),
             ("did not manage to locate a library called 'augeas'", "pkg-config"),
             ("pkg-config: command not found", "pkg-config"),
-            ("krb5-config", "krb5Full"),
+            ("krb5-config", "krb5"),
             ("libpyvex.so -> not found!", "final.pyvex"),
             ('#include "cairo.h"', ["pkgs.cairo.dev", "pkg-config"]),
             (
@@ -196,7 +201,17 @@ class NativeBuildInputs(Rule):
             ),
             ("ModuleNotFoundError: No module named 'torch'", "final.torch"),
             ("ta_defs.h: No such file", "ta-lib"),
-            ("lber.h: No such file", ["openldap.dev", "pkg-config"]),
+            ("Program 'swig' not found or not executable", ["swig"]),
+            (" fatal error: ffi.h: No such file or directory", ["pkg-config"]),
+            (
+                "Unable to locate bz2 library needed when enabling bzip2 support",
+                ["bzip2.dev", "pkg-config"],
+            ),
+            ("gmp.h: No such file or directory", ["pkg-config", "gmp.dev"]),
+            ("ModuleNotFoundError: No module named 'pip'", "final.pip"),
+            ("Could not run curl-config", "curl"),
+            ("do you have the `libxml2` development package installed?", "libxml2"),
+            ("cannot get XMLSec1", "pkgs.xmlsec.out"),
         ]:
             if q in drv_log:
                 if isinstance(vs, list):
@@ -234,6 +249,18 @@ class NativeBuildInputs(Rule):
         return RuleOutput(arguments=args, src_attrset_parts=src_attrset)
 
 
+class BorkedRuntimeDepsCheck(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        # todo: make this less generic?
+        return "not satisfied by version" in drv_log
+
+    @staticmethod
+    def apply(opts):
+        src_attrset = {"env": {"dontCheckRuntimeDeps": True}}
+        return RuleOutput(src_attrset_parts=src_attrset)
+
+
 class BuildInputs(Rule):
     @staticmethod
     def match(drv, drv_log, opts, _rules_here):
@@ -242,10 +269,10 @@ class BuildInputs(Rule):
         # if 'Dependency "OpenBLAS" not found,' in drv_log:
         #     opts.append(nix_literal("pkgs.blas"))
         #     opts.append(nix_literal("pkgs.lapack"))
-        for k, pkg in [
+        for k, pkgs in [
             ("error: libhdf5.so: cannot open shared object file", "hdf5"),
             ("libtbb.so.12 -> not found!", "tbb_2021_11.out"),
-            ("zlib.h: No such file or directory", "zlib.out"),
+            ("zlib.h: No such file or directory", "pkgs.zlib.out"),
             ("No package 'libswscale' found", "ffmpeg"),
             ("libtensorflow_framework.so.2 -> not found!", "libtensorflow"),
             ("libnvJitLink.so.12 -> not found!", "cudaPackages.libnvjitlink"),
@@ -282,6 +309,7 @@ class BuildInputs(Rule):
             ("liblzma.so.5 -> not found!", "xz"),
             ("libxml2.so.2 -> not found!", "libxml2"),
             ("libSDL2-2.0.so.0 -> not found!", "SDL2"),
+            ("libodbc.so.2 -> not found!", "unixODBC"),
             ("alsa/asoundlib.h", "pkgs.alsa-lib"),
             (
                 "Specify MYSQLCLIENT_CFLAGS and MYSQLCLIENT_LDFLAGS env vars manually",
@@ -293,10 +321,27 @@ class BuildInputs(Rule):
             (" #include <boost/optional.hpp>", "boost"),
             ("/poppler-document.h: No such", "poppler"),
             ("Could not find required package: opencv.", "opencv4"),
+            ("chm_lib.h: No such file", "chmlib"),  #
+            ("C shared or static library 'blas' not found", "blas"),
+            ("C header 'umfpack.h' not found", "suitesparse"),
+            ("incdir = os.path.relpath(np.get_include())", "final.numpy"),
+            ("libc.musl-x86_64.so.1", "musl"),
+            (" fatal error: ffi.h: No such file or directory", "libffi"),
+            ("lber.h: No such file", ["pkgs.openldap.dev", "pkg-config", "cyrus_sasl"]),
+            ("gmp.h: No such file or directory", ["gmp"]),
+            ("lzma.h: No such file", "pkgs.xz.dev"),
+            ('#include "portaudio.h"', ["portaudio"]),
+            ("cannot get XMLSec1", "pkgs.xmlsec.dev"),
             # (" RequiredDependencyException: pangocairo", "pango"),
         ]:
             if k in drv_log:
-                opts.append(nix_literal(f"pkgs.{pkg}"))
+                if isinstance(pkgs, str):
+                    pkgs = [pkgs]
+                for pkg in pkgs:
+                    if not "." in pkg or pkg.startswith("cudaPackages"):
+                        opts.append(nix_literal(f"pkgs.{pkg}"))
+                    else:
+                        opts.append(nix_literal(pkg))
 
         return sorted(set(opts))
 
@@ -319,6 +364,38 @@ class BuildInputs(Rule):
             # nixpkgs 24.05 has no cudnn 9.x
             requires_nixpkgs_master=needs_master,
         )
+
+
+# can't get that to work so far... also see angr.
+# class OtherPythonPackagesLDSearchPath(Rule):
+#     @staticmethod
+#     def match(drv, drv_log, opts, rules_here):
+#         if "libboost_python312.so.1.83.0 -> not found!" in drv_log:
+#             return "cmeel-boost"
+
+#     @staticmethod
+#     def apply(opts):
+#         if opts == "cmeel-boost":
+#             return RuleOutput(
+#                 arguments=["final"],
+#                 src_attrset_parts={
+#                     "libs": "${final.cmeel-boost}/lib/python3.12/site-packages/cmeel.prefix/lib"
+#                 },
+#             )
+
+
+class MasterForTorch(Rule):
+    always_reapply = True
+
+    @staticmethod
+    def match(drv, drv_log, opts, rules_here):
+        return nix_literal("pkgs.cudaPackages.cudnn") in rules_here.get(
+            "BuildInputs", []
+        )
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutput(requires_nixpkgs_master=True)
 
 
 manual_rule_path = None  # set from outside
@@ -469,13 +546,21 @@ class DowngradeNumpy(Rule):
 
     @staticmethod
     def match(drv, drv_log, opts, _rules_here):
-        return (
+        if (
             "'int_t' is not a type identifier" in drv_log and "np.int_t" in drv_log
-        )  # or ("numpy/arrayobject.h: No such file" in drv_log)
+            ):
+            return "<2"
+        elif "No module named 'numpy.distutils'" in drv_log:
+            return "<1.22"
+
+
+        # or ("numpy/arrayobject.h: No such file" in drv_log)
 
     @staticmethod
     def apply(opts):
-        return RuleOutput(dep_constraints={"numpy": "<2"})
+        if opts is True:
+            opts = "<2"
+        return RuleOutput(dep_constraints={"numpy": opts})
 
 
 class DowngradePython(Rule):
@@ -486,6 +571,18 @@ class DowngradePython(Rule):
         if "3.12" in drv_log and "No module named 'distutils'" in drv_log:
             return "3.11"
         if "greenlet-1.1.0" in drv_log:
+            return "3.10"
+        if (
+            "return kh_float64_hash_func(val.real)^kh_float64_hash_func(val.imag);"
+            in drv_log
+        ):
+            return "3.10"  # old pandas 1.5.3
+        if "ModuleNotFoundError: No module named 'distutils'" in drv_log:
+            return "3.11"
+        if "fatal error: longintrepr.h: " in drv_log:
+            return "3.10"
+        if "AttributeError: fcompiler. Did you mean: 'compiler'?" in drv_log:
+            # that's trying to compile numpy 1.22, o
             return "3.10"
 
     @staticmethod
@@ -563,6 +660,8 @@ class Enum34(Rule):
 
 
 class PythonTooNew(Rule):
+    # and we need to exclude this from our builds
+    # see DowngradePython for the other case
     @staticmethod
     def match(drv, drv_log, opts, _rules_here):
         if "type object 'Callable' has no attribute '_abc_registry'" in drv_log:
@@ -574,6 +673,25 @@ class PythonTooNew(Rule):
         if "This backport is meant only for Python 2." in drv_log:
             pkg_tuple = drv_to_pkg_and_version(drv)
             return "This backport is meant only for Python 2. {pkg_tuple}"
+        if " error: invalid use of incomplete typedef ‘PyInterpreterState" in drv_log:
+            return (
+                "invalid use of incomplete typedef ‘PyInterpreterState’ (python <3.8?)"
+            )
+        if "Supported interpreter versions: 3.5, 3.6, 3.7, 3.8\n" in drv_log:
+            pkg_tuple = drv_to_pkg_and_version(drv)
+            return f"Supported interpreter versions: 3.5, 3.6, 3.7, 3.8: {pkg_tuple}"
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutputTriggerExclusion(opts)
+
+
+class MacOnly(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        if "PyObjC requires macOS to build" in drv_log:
+            pkg_tuple = drv_to_pkg_and_version(drv)
+            return f"PyObjC requires macOS to build: {pkg_tuple}"
 
     @staticmethod
     def apply(opts):
