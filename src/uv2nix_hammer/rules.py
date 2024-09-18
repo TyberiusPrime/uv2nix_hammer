@@ -47,6 +47,7 @@ class BuildSystems(Rule):
                     )  # if it's older than the cython3 release date...
                 )
                 or "Cython.Compiler.Errors.CompileError:" in drv_log
+                or "Cython<3,>=0.29.16" in drv_log
                 # or "gcc' failed with exit code" in drv_log
             ):
                 log.debug("\tTrying with cython_0")
@@ -99,7 +100,7 @@ class BuildSystems(Rule):
                 opts.append("pycodestyle")
             if "isort" in drv_log:
                 opts.append("isort")
-            if "cython" in drv_log:
+            if "cython" in drv_log or "Cython" in drv_log:
                 opts.append("cython")
             if "pkgconfig" in drv_log:
                 opts.append("pkgconfig")
@@ -107,6 +108,7 @@ class BuildSystems(Rule):
                 opts.append("pip")
             if "pbr" in drv_log:
                 opts.append("pbr")
+
         if (
             "Cython.Compiler.Errors.CompileError:" in drv_log
             and not "cython" in opts
@@ -118,6 +120,9 @@ class BuildSystems(Rule):
         if "poetry" in opts:
             opts.remove("poetry")
             opts.append("poetry-core")
+
+        while "cython" in opts and "cython_0" in opts:
+            opts.remove("cython")
 
         return opts
 
@@ -168,9 +173,20 @@ class NativeBuildInputs(Rule):
     def match(drv, drv_log, opts, _rules_here):
         if opts is None:
             opts = []
+
+        def add_pkgs(x):
+            do_add = not "." in x
+            do_add |= ".dev" in x
+            do_add |= "cudaPackages." in x
+            if do_add:
+                return "pkgs." + x
+            else:
+                return x
+
         for q, vs in [
             ("No such file or directory: 'gfortran'", "gfortran"),
             ("but no Fortran compiler found", "gfortran"),
+            ("No CMAKE_Fortran_COMPILER could be found.", "gfortran"),
             ("Did not find pkg-config", "pkg-config"),
             ("No such file or directory: 'pkg-config'", "pkg-config"),
             (
@@ -182,6 +198,7 @@ class NativeBuildInputs(Rule):
             ('"pkg-config" command could not be found.', "pkg-config"),
             ("CMake must be installed to build from source.", "cmake"),
             ("CMake is not installed on your system!", "cmake"),
+            ("Cannot find CMake executable", "cmake"),
             ("checking for GTK+ - version >= 3.0.0... no", ["gtk3", "pkg-config"]),
             ("systemd/sd-daemon.h: No such file", "pkg-config"),  # cysystemd
             ("cython<1.0.0,>=0.29", "final.cython_0"),
@@ -212,19 +229,17 @@ class NativeBuildInputs(Rule):
             ("Could not run curl-config", "curl"),
             ("do you have the `libxml2` development package installed?", "libxml2"),
             ("cannot get XMLSec1", "pkgs.xmlsec.out"),
+            ("Can not locate liberasurecode.so.1", "pkgs.liberasurecode.dev"),
+            ("Error finding javahome on linux", "pkgs.openjdk"),
+            ("cuda.h: No such file", "cudaPackages.cuda_cudart"),
+            ("sndfile.h: No such file", ["pkgs.libsndfile.dev", 'pkg-config']),
+            #("cudaProfiler.h", "cudaPackages.cuda_nvml_dev"),
         ]:
             if q in drv_log:
-                if isinstance(vs, list):
-                    opts.extend(
-                        nix_literal(("pkgs." + x) if not "." in x or ".dev" in x else x)
-                        for x in vs
-                    )
-                else:
-                    opts.append(
-                        nix_literal(
-                            ("pkgs." + vs) if not "." in vs or ".dev" in vs else vs
-                        )
-                    )
+                if not isinstance(vs, list):
+                    vs = [vs]
+                for x in vs:
+                    opts.append(nix_literal(add_pkgs(x)))
 
         return sorted(set(opts))
 
@@ -271,7 +286,8 @@ class BuildInputs(Rule):
         #     opts.append(nix_literal("pkgs.lapack"))
         for k, pkgs in [
             ("error: libhdf5.so: cannot open shared object file", "hdf5"),
-            ("libtbb.so.12 -> not found!", "tbb_2021_11.out"),
+            ("libtbb.so.12 -> not found!", "pkgs.tbb_2021_11.out"),
+            ("libtbb.so.2 -> not found!", "pkgs.tbb.out"),
             ("zlib.h: No such file or directory", "pkgs.zlib.out"),
             ("No package 'libswscale' found", "ffmpeg"),
             ("libtensorflow_framework.so.2 -> not found!", "libtensorflow"),
@@ -289,6 +305,8 @@ class BuildInputs(Rule):
                 "libcudnn.so.9 -> not found!",
                 "cudaPackages.cudnn",
             ),  # that means we also need mater...
+            ("cuda.h: No such file", "cudaPackages.cuda_cudart"),
+            #("cudaProfiler.h", "cudaPackages.cuda_nvml_dev"),
             ("libnccl.so.2 -> not found!", "cudaPackages.nccl"),
             (
                 "ld: cannot find -lncurses:",
@@ -332,6 +350,9 @@ class BuildInputs(Rule):
             ("lzma.h: No such file", "pkgs.xz.dev"),
             ('#include "portaudio.h"', ["portaudio"]),
             ("cannot get XMLSec1", "pkgs.xmlsec.dev"),
+            ("Can not locate liberasurecode.so.1", "pkgs.liberasurecode.out"),
+            ("Error finding javahome on linux", "pkgs.openjdk"),
+            ("sndfile.h: No such file", "pkgs.libsndfile.out"),
             # (" RequiredDependencyException: pangocairo", "pango"),
         ]:
             if k in drv_log:
@@ -546,13 +567,10 @@ class DowngradeNumpy(Rule):
 
     @staticmethod
     def match(drv, drv_log, opts, _rules_here):
-        if (
-            "'int_t' is not a type identifier" in drv_log and "np.int_t" in drv_log
-            ):
+        if "'int_t' is not a type identifier" in drv_log and "np.int_t" in drv_log:
             return "<2"
         elif "No module named 'numpy.distutils'" in drv_log:
             return "<1.22"
-
 
         # or ("numpy/arrayobject.h: No such file" in drv_log)
 
@@ -584,6 +602,10 @@ class DowngradePython(Rule):
         if "AttributeError: fcompiler. Did you mean: 'compiler'?" in drv_log:
             # that's trying to compile numpy 1.22, o
             return "3.10"
+        if "ModuleNotFoundError: No module named 'imp'" in drv_log:
+            return "3.11"
+        if "only versions >=3.6,<3.10 are supported." in drv_log:
+            return "3.9"
 
     @staticmethod
     def apply(opts):
@@ -680,6 +702,15 @@ class PythonTooNew(Rule):
         if "Supported interpreter versions: 3.5, 3.6, 3.7, 3.8\n" in drv_log:
             pkg_tuple = drv_to_pkg_and_version(drv)
             return f"Supported interpreter versions: 3.5, 3.6, 3.7, 3.8: {pkg_tuple}"
+        if (
+            "AttributeError: module 'distutils.util' has no attribute 'run_2to3'"
+            in drv_log
+        ):
+            pkg_tuple = drv_to_pkg_and_version(drv)
+            return f"distutils.util has no run_2to3: {pkg_tuple}"
+        if "setup command: use_2to3 is invalid." in drv_log:
+            pkg_tuple = drv_to_pkg_and_version(drv)
+            return "setuptools too new, setup command: use_2to3 is invalid. {pkg_tuple}"
 
     @staticmethod
     def apply(opts):
@@ -696,3 +727,19 @@ class MacOnly(Rule):
     @staticmethod
     def apply(opts):
         return RuleOutputTriggerExclusion(opts)
+
+
+class QTDontWrap(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        return (
+            "Error: wrapQtAppsHook is not used, and dontWrapQtApps is not set."
+            in drv_log
+        )
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutput(
+            wheel_attrset_parts={"dontWrapQtApps": True},
+            src_attrset_parts={"dontWrapQtApps": True},
+        )

@@ -61,7 +61,9 @@ def write_flake_nix(
     python_version,
     nixpkgs_version="24.05",
 ):
-    log.debug(f"Writing flake, python_version={python_version}, nixpkgs={nixpkgs_version}")
+    log.debug(
+        f"Writing flake, python_version={python_version}, nixpkgs={nixpkgs_version}"
+    )
     flatpythonver = python_version.replace(".", "")
     (folder / "flake.nix").write_text(f"""
 {{
@@ -175,7 +177,7 @@ def verify_target_on_pypi(pkg, version, cache_folder):
         if value.get("url").endswith(".tar.gz"):
             had_src = True
             break
-    name = info['info']['name'] # the prefered spelling
+    name = info["info"]["name"]  # the prefered spelling
     return name, version, had_src
 
 
@@ -239,7 +241,7 @@ def try_to_fix_infinite_recursion(project_folder):
     # let's see if there's a loop in uv.lock
     # and if there is, add a rule to remove it?
 
-    #raise ValueError("TODO")  # once I know how to fix this
+    # raise ValueError("TODO")  # once I know how to fix this
     cycles = find_cycles_in_uv_lock(project_folder)
     log.debug("Detected infinite recursion")
     if not cycles:
@@ -352,7 +354,7 @@ def write_combined_rules(path, rules_to_combine, project_folder):
                 if f"{arg}." in rule_output.inner:
                     function_arguments.add(arg)
             function_arguments.update(rule_output.args)
-            further_funcs.append("old:" + rule_output.inner)
+            further_funcs.append("old: " + rule_output.inner)
         elif isinstance(rule_output, RuleOutputTriggerExclusion):
             log.info("Triggered exclusion")
             raise NeedsExclusion(rule_output.reason)
@@ -387,7 +389,10 @@ def write_combined_rules(path, rules_to_combine, project_folder):
                         raise ValueError("Dep conflict, think up a merge strategy")
                     dep_constraints[k] = v
             if rule_output.python_downgrade:
-                if python_downgrade and python_downgrade != rule_output.python_downgrade:
+                if (
+                    python_downgrade
+                    and python_downgrade != rule_output.python_downgrade
+                ):
                     raise ValueError("Conflicting python downgrades")
                 python_downgrade = rule_output.python_downgrade
         else:
@@ -439,9 +444,13 @@ def write_combined_rules(path, rules_to_combine, project_folder):
     wheel_body = nix_format(wheel_attrset_parts)
     funcs = []
     if src_attrset_parts or wheel_attrset_parts:
-        funcs.append(
-            f"""old: if ((old.format or "sdist") == "wheel") then {wheel_body} else {src_body}"""
-        )
+        if src_body == wheel_body:
+            funcs.append(f"""old: {src_body}""")
+
+        else:
+            funcs.append(
+                f"""old: if ((old.format or "sdist") == "wheel") then {wheel_body} else {src_body}"""
+            )
     funcs.extend(further_funcs)
     if len(funcs) == 1:
         out_body = f"""
@@ -465,7 +474,9 @@ def write_combined_rules(path, rules_to_combine, project_folder):
     """
     else:
         out_body = False
-    if out_body: # no need to write a default.nix if all we did was downgrade pytohn or such
+    if (
+        out_body
+    ):  # no need to write a default.nix if all we did was downgrade pytohn or such
         if function_arguments:
             head = f"{{{", ".join(function_arguments)}, ...}}"
         else:
@@ -502,10 +513,11 @@ def extend_pyproject_toml_with_dep_constraints(dep_constraints, pyproject_toml_p
         pyproject_toml_path.parent,
     )
 
+
 def downgrade_python(python_version, pyproject_toml_path):
     log.warn(f"Downgrading to python {python_version}")
     input = toml.loads(pyproject_toml_path.read_text())
-    input['project']['requires-python'] = f"~={python_version}"
+    input["project"]["requires-python"] = f"~={python_version}"
     pyproject_toml_path.write_text(toml.dumps(input))
     uv_lock(
         pyproject_toml_path.parent,
@@ -516,7 +528,6 @@ def downgrade_python(python_version, pyproject_toml_path):
     #                                  f'pkgs.python{flat_py_version}')
     # assert flake_input != flake_output
     # pyproject_toml_path.with_name('flake.nix').write_text(flake_output)
-
 
 
 def check_for_wheel_build(drv):
@@ -562,7 +573,7 @@ def detect_rules(project_folder, overrides_folder, failures):
                     drv, drv_log, copy_if_non_value(old_opts), rules_here.copy()
                 ):
                     rules_here[rule_name] = opts
-                    if opts != old_opts or opts and hasattr(rule, 'always_reapply'):
+                    if opts != old_opts or opts and hasattr(rule, "always_reapply"):
                         any_applied = True
                         log.info(
                             f"Rule hit! {rule_name} in {pkg_tuple}}}. Now: {opts} - was: {old_opts}"
@@ -821,7 +832,6 @@ def main():
         )
         if not rules_here:
             raise ValueError("No rules")
-        # I don't think I'm gonna keep rules_wheel actually
         path = (
             overrides_folder
             / "overrides"
@@ -884,7 +894,9 @@ def main():
                 except InfiniteRecursionError:
                     if attempt_no == 0:
                         new_rules = try_to_fix_infinite_recursion(project_folder)
-                        requires_nixpkgs_master, python_downgrade = write_rules(True, new_rules, overrides_folder, project_folder)
+                        requires_nixpkgs_master, python_downgrade = write_rules(
+                            True, new_rules, overrides_folder, project_folder
+                        )
                         attempt_no += 1
                         continue
                     else:
@@ -899,7 +911,7 @@ def main():
                 any_applied, new_rules = detect_rules(
                     project_folder, overrides_folder, failures
                 )
-                requires_nixpkgs_master, python_downgrade= write_rules(
+                requires_nixpkgs_master, python_downgrade = write_rules(
                     any_applied, new_rules, overrides_folder, project_folder
                 )
                 if not any_applied:
