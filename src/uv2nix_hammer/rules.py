@@ -1,20 +1,26 @@
 from os import stat
+import subprocess
+import tempfile
 import re
 from .helpers import (
-    extract_pyproject_toml_from_archive,
-    search_and_extract_from_archive,
-    has_pyproject_toml,
-    get_src,
-    log,
-    RuleOutput,
-    RuleFunctionOutput,
-    RuleOutputTriggerExclusion,
-    Rule,
     drv_to_pkg_and_version,
+    extract_pyproject_toml_from_archive,
+    extract_source,
     get_release_date,
+    get_src,
+    has_pyproject_toml,
+    log,
+    Rule,
+    RuleFunctionOutput,
+    RuleOutput,
+    RuleOutputCopyFile,
+    RuleOutputTriggerExclusion,
+    search_in_archive,
+    search_and_extract_from_archive,
 )
 import datetime
 from pathlib import Path
+from packaging.version import Version
 from .nix_format import nix_literal
 
 
@@ -33,8 +39,8 @@ class BuildSystems(Rule):
     @classmethod
     def match(cls, drv, drv_log, opts, _rules_here):
         # the cython3 thing is a debacle.
+        pkg, version = drv_to_pkg_and_version(drv)
         if opts and "cython" in opts:  # -> we already tried it with cython3
-            pkg, version = drv_to_pkg_and_version(drv)
             release_date = get_release_date(pkg, version)
             # log.debug(
             #     f"Tried cython(3) and failed - checking release date: {release_date}"
@@ -60,7 +66,7 @@ class BuildSystems(Rule):
                 src = get_src(drv)
                 try:
                     pyproject_toml = extract_pyproject_toml_from_archive(src)
-                    log.debug(f"\tgot pyproject.toml for {drv}")
+                    # log.debug(f"\tgot pyproject.toml for {drv}")
                     opts = list(  # sorting is just before return
                         set(
                             [
@@ -71,12 +77,6 @@ class BuildSystems(Rule):
                             ]
                         )
                     )
-                    filtered_build_systems = [
-                        "hatch-docstring-description",  # not in nixpkgs and useless-for-our-purposes-metadata anyway
-                        "setuptools-scm-git-archive",  # marked as broken in nixpkgs, plugin is obsolete, setuptools-scm can do it.
-                    ]
-                    opts = [x for x in opts if not x in filtered_build_systems]
-                    log.debug(f"\tfound build-systems: {opts}")
                 except KeyError:
                     opts = []
             except ValueError:
@@ -84,30 +84,45 @@ class BuildSystems(Rule):
         if "No module named 'setuptools'" in drv_log:
             if not "setuptools" in opts:
                 opts.append("setuptools")
+        if "No module named pip" in drv_log and not "pip" in opts:
+            opts.append("pip")
         if "RuntimeError: Running cythonize failed!" in drv_log and "cython" in opts:
             log.debug("detected failing cython - trying cython_0")
             opts.remove("cython")
             opts.append("cython_0")
         if "Missing dependencies:" in drv_log:
+            lines = [
+                x.strip()
+                for x in drv_log[drv_log.find("Missing dependencies:") :].split("\n")
+            ]
             # log.error(f"Missing dependencies - {drv}")
-            if "setuptools-scm" in drv_log or "setuptools_scm" in drv_log:
+            if "setuptools-scm" in lines or "setuptools_scm" in lines:
                 opts.append("setuptools-scm")
-            if "setuptools-git" in drv_log or "setuptools_git" in drv_log:
+            if "setuptools-git" in lines or "setuptools_git" in lines:
                 opts.append("setuptools-git")
-            if "pytest-runner" in drv_log:
+            # if "setuptools-git-version" in drv_log:
+            #     opts.append("setuptools-git-version") # currently not in nixpkgs
+            if "pytest-runner" in lines:
                 opts.append("pytest-runner")
-            if "pycodestyle" in drv_log:
+            if "pycodestyle" in lines:
                 opts.append("pycodestyle")
-            if "isort" in drv_log:
+            if "isort" in lines:
                 opts.append("isort")
-            if "cython" in drv_log or "Cython" in drv_log:
+            if "cython" in lines or "Cython" in lines:
                 opts.append("cython")
-            if "pkgconfig" in drv_log:
-                opts.append("pkgconfig")
-            if "pip" in drv_log:
+            if "pip" in lines:
                 opts.append("pip")
-            if "pbr" in drv_log:
+            if "pbr" in lines:
                 opts.append("pbr")
+            if "cffi" in lines:
+                opts.append("cffi")
+            if "wheel" in lines:
+                opts.append("wheel")
+        if "cppyy-cling" in drv_log:
+            opts.append("cppyy-cling")
+        if "cppyy-backend" in drv_log:
+            opts.append("cppyy-backend")
+        opts = [x for x in opts if x != pkg]
 
         if (
             "Cython.Compiler.Errors.CompileError:" in drv_log
@@ -123,12 +138,19 @@ class BuildSystems(Rule):
 
         while "cython" in opts and "cython_0" in opts:
             opts.remove("cython")
+        filtered_build_systems = [
+            "hatch-docstring-description",  # not in nixpkgs and useless-for-our-purposes-metadata anyway
+            "setuptools-scm-git-archive",  # marked as broken in nixpkgs, plugin is obsolete, setuptools-scm can do it.
+            "maturin",  # handled by rust below... todo: setuptools-rust
+        ]
+        opts = [x for x in opts if not x in filtered_build_systems]
+        log.debug(f"\tfound build-systems: {opts} (after filtering)")
 
         return opts
 
     @staticmethod
     def apply(opts):
-        return RuleOutput(build_inputs=opts)
+        return RuleOutput(build_systems=opts)
 
 
 class PoetryMasonry(Rule):
@@ -178,6 +200,8 @@ class NativeBuildInputs(Rule):
             do_add = not "." in x
             do_add |= ".dev" in x
             do_add |= "cudaPackages." in x
+            if x.startswith("pkgs"):
+                do_add = False
             if do_add:
                 return "pkgs." + x
             else:
@@ -188,6 +212,8 @@ class NativeBuildInputs(Rule):
             ("but no Fortran compiler found", "gfortran"),
             ("No CMAKE_Fortran_COMPILER could be found.", "gfortran"),
             ("Did not find pkg-config", "pkg-config"),
+            ("pkgconfig", "pkg-config"),
+            ("pkg-config not found", "pkg-config"),
             ("No such file or directory: 'pkg-config'", "pkg-config"),
             (
                 "The headers or library files could not be found for zlib",
@@ -232,10 +258,28 @@ class NativeBuildInputs(Rule):
             ("Can not locate liberasurecode.so.1", "pkgs.liberasurecode.dev"),
             ("Error finding javahome on linux", "pkgs.openjdk"),
             ("cuda.h: No such file", "cudaPackages.cuda_cudart"),
-            ("sndfile.h: No such file", ["pkgs.libsndfile.dev", 'pkg-config']),
-            #("cudaProfiler.h", "cudaPackages.cuda_nvml_dev"),
+            ("sndfile.h: No such file", ["pkgs.libsndfile.dev", "pkg-config"]),
+            ("No such file or directory: 'gdal-config'", "gdal"),
+            ("No such file or directory: 'which'", "which"),
+            ("#include <xc.h>", "libxc"),
+            ("#include <notmuch.h>", "notmuch"),
+            (
+                "#include <xkbcommon/xkbcommon.h>",
+                ["pkgs.libxkbcommon.out", "pkgs.libxkbcommon.dev", "pkg-config"],
+            ),
+            ("cannot find -lvapoursynth", "vapoursynth"),
+            ("PyAPI_FUNC(PyCodeObject *) PyCode_New(", "final.cython_0"),
+            ("pcap.h: No such file", "libpcap"),
+            ("lzo1.h: No such file", "lzo"),
+            # (
+            #     re.compile(
+            #         "do not know how to unpack source archive [^.]+.zip",
+            #     ),
+            #     "unzip",
+            # ),
         ]:
-            if q in drv_log:
+            is_str = isinstance(q, str)
+            if (is_str and q in drv_log) or (not is_str and q.search(drv_log)):
                 if not isinstance(vs, list):
                     vs = [vs]
                 for x in vs:
@@ -293,9 +337,12 @@ class BuildInputs(Rule):
             ("libtensorflow_framework.so.2 -> not found!", "libtensorflow"),
             ("libnvJitLink.so.12 -> not found!", "cudaPackages.libnvjitlink"),
             ("libcublas.so.12 -> not found!", "cudaPackages.libcublas"),
+            ("libcublas.so.11 -> not found!", "cudaPackages_11.libcublas"),
             ("libcusparse.so.12 -> not found!", "cudaPackages.libcusparse"),
+            ("libcusparse.so.11 -> not found!", "cudaPackages_11.libcusparse"),
             ("libcusolver.so.11 -> not found", "cudaPackages_11.libcusolver"),
             ("libcudart.so.12 -> not found", "cudaPackages.cuda_cudart"),
+            ("libcudart.so.11.0 -> not found", "cudaPackages_11.cuda_cudart"),
             ("libnvrtc.so.12 -> not found!", "cudaPackages.cuda_nvrtc"),
             ("libcupti.so.12 -> not found!", "cudaPackages.cuda_cupti"),
             ("libcufft.so.11 -> not found!", "cudaPackages.libcufft"),
@@ -306,7 +353,7 @@ class BuildInputs(Rule):
                 "cudaPackages.cudnn",
             ),  # that means we also need mater...
             ("cuda.h: No such file", "cudaPackages.cuda_cudart"),
-            #("cudaProfiler.h", "cudaPackages.cuda_nvml_dev"),
+            # ("cudaProfiler.h", "cudaPackages.cuda_nvml_dev"),
             ("libnccl.so.2 -> not found!", "cudaPackages.nccl"),
             (
                 "ld: cannot find -lncurses:",
@@ -353,16 +400,25 @@ class BuildInputs(Rule):
             ("Can not locate liberasurecode.so.1", "pkgs.liberasurecode.out"),
             ("Error finding javahome on linux", "pkgs.openjdk"),
             ("sndfile.h: No such file", "pkgs.libsndfile.out"),
+            ("No such file or directory: 'gdal-config'", "gdal"),
+            ("cannot find -lnotmuch:", "notmuch"),
+            ("#include <xkbcommon/xkbcommon.h>", "pkgs.libxkbcommon.out"),
+            ("libpyvex.so -> not found", "final.pyvex"),  # wheel doesn't declare it...
+            ("libpam.so.0 -> not found!", "linux-pam"),
+            ("libcrypt.so.1 -> not found!", "libxcrypt-legacy"),
             # (" RequiredDependencyException: pangocairo", "pango"),
         ]:
             if k in drv_log:
                 if isinstance(pkgs, str):
                     pkgs = [pkgs]
                 for pkg in pkgs:
-                    if not "." in pkg or pkg.startswith("cudaPackages"):
-                        opts.append(nix_literal(f"pkgs.{pkg}"))
+                    if not pkg.startswith("~literal:!:"):
+                        if not "." in pkg or pkg.startswith("cudaPackages"):
+                            opts.append(nix_literal(f"pkgs.{pkg}"))
+                        else:
+                            opts.append(nix_literal(pkg))
                     else:
-                        opts.append(nix_literal(pkg))
+                        opts.append(pkg)
 
         return sorted(set(opts))
 
@@ -378,10 +434,20 @@ class BuildInputs(Rule):
         needs_master = nix_literal("pkgs.cudaPackages.cudnn") in opts
         if needs_master:
             log.debug("Switching to master because of cuda")
+        fixups = ""
+        for pkg in opts:
+            if pkg.startswith("~literal:!:final."):
+                pkg_str = pkg[len("~literal:!:final.") :]
+                fixups += f"addAutoPatchelfSearchPath ${{final.{pkg_str}}}/${{final.python.sitePackages}}/{pkg_str}/lib\n"
+        src_attr_parts = {"buildInputs": opts, "env": env}
+        wheel_attr_parts = {"buildInputs": opts}
+        if fixups:
+            wheel_attr_parts["preFixup"] = fixups
+            # src_attr_parts["libs"] = libs
         return RuleOutput(
             arguments=["pkgs"],
-            src_attrset_parts={"buildInputs": opts, "env": env},
-            wheel_attrset_parts={"buildInputs": opts},
+            src_attrset_parts=src_attr_parts,
+            wheel_attrset_parts=wheel_attr_parts,
             # nixpkgs 24.05 has no cudnn 9.x
             requires_nixpkgs_master=needs_master,
         )
@@ -430,8 +496,10 @@ class ManualOverrides(Rule):
             return "pillow"
         # no need for version searching here. If you need to reuse the rules for other versions
         # drop a symlink.
+        p = manual_rule_path / pkg / version / "default.nix"
         log.debug(
-            f"Manual path would be {(manual_rule_path / pkg / version / 'default.nix')}"
+            f"Manual path would be {p} "
+            + ("(present)" if p.exists() else "(not present)")
         )
         if (manual_rule_path / pkg / version / "default.nix").exists():
             return "__file__:" + pkg + "/" + version + "/default.nix"
@@ -439,7 +507,7 @@ class ManualOverrides(Rule):
 
     @staticmethod
     def apply(opts):
-        if opts == "pillow":
+        if opts == "pillow":  # todo: turn into a default.nix
             return RuleOutput(
                 arguments=["pkgs"],
                 src_attrset_parts={
@@ -453,6 +521,25 @@ class ManualOverrides(Rule):
             return RuleFunctionOutput((manual_rule_path / fn).read_text())
         else:
             return None
+
+
+class ManualOverrideAdditionalFiles(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        pkg, version = drv_to_pkg_and_version(drv)
+        try:
+            files = [
+                x
+                for x in (manual_rule_path / pkg / version).glob("*")
+                if x.name != "default.nix"
+            ]
+            return files
+        except FileNotFoundError:
+            return None
+
+    def apply(opts):
+        if opts:
+            return RuleOutputCopyFile(opts)
 
 
 class MissingEmptyFiles(Rule):
@@ -582,7 +669,7 @@ class DowngradeNumpy(Rule):
 
 
 class DowngradePython(Rule):
-    """Downgrade numpy when it's a clear >= 2.0 not suppported case"""
+    """Downgrade python if necessary"""
 
     @staticmethod
     def match(drv, drv_log, opts, _rules_here):
@@ -605,6 +692,13 @@ class DowngradePython(Rule):
         if "ModuleNotFoundError: No module named 'imp'" in drv_log:
             return "3.11"
         if "only versions >=3.6,<3.10 are supported." in drv_log:
+            return "3.9"
+        if "pygame" in drv:
+            pkg_tuple = drv_to_pkg_and_version(drv)
+            version = pkg_tuple[1]
+            if Version(version) <= Version("2.5.2"):
+                return "3.11"
+        if "cannot import name 'build_py_2to3' from 'distutils" in drv_log:
             return "3.9"
 
     @staticmethod
@@ -633,6 +727,8 @@ class IsPython2Only(Rule):
             return (
                 f"Is_python2_only (file is not defined): {drv_to_pkg_and_version(drv)}"
             )
+        if "except OSError, e:" in drv_log:
+            return f"Is_python2_only (except OSError, e): {drv_to_pkg_and_version(drv)}"
 
     @staticmethod
     def apply(opts):
@@ -653,7 +749,23 @@ class Rust(Rule):
 
     @staticmethod
     def apply(opts):
-        return RuleFunctionOutput("""
+        opts, extract_result = opts
+        needed_patch = extract_result
+        # todo: discern maturin & setuptoolsRust
+        if needed_patch:
+            return RuleFunctionOutput("""
+              pkgs.lib.optionalAttrs (old.format or "sdist" != "wheel") (
+              helpers.standardMaturin {
+              furtherArgs = {
+                  postPatch = old.postPatch or "" + ''
+                  cp ${./Cargo.lock} Cargo.lock
+                  '';
+              };
+              } old)
+                                  """)
+
+        else:
+            return RuleFunctionOutput("""
                                   pkgs.lib.optionalAttrs (old.format or "sdist" != "wheel") (helpers.standardMaturin {} old)
                                   """)
 
@@ -663,11 +775,64 @@ class Rust(Rule):
         target_path.parent.mkdir(parents=True, exist_ok=True)
         src = get_src(drv)
         try:
-            cargo_lock = search_and_extract_from_archive(src, "Cargo.lock")
+            cargo_lock, needed_patch = (
+                search_and_extract_from_archive(src, "Cargo.lock"),
+                False,
+            )
         except KeyError:
-            raise ValueError("implement cargo lock builder")
+            cargo_lock, needed_patch = Rust.build_missing_cargo_lock(drv, src), True
+            # raise ValueError(f"implement cargo lock builder. Derivation was {drv}")
 
         target_path.write_text(cargo_lock)
+        return str(target_path) if needed_patch else None
+
+    def build_missing_cargo_lock(drv, src):
+        pkg, version = drv_to_pkg_and_version(drv)
+        log.info(f"Creating a missing Cargo.lock for {pkg}-{version}")
+        tf = tempfile.TemporaryDirectory(delete=True)
+        extract_source(src, tf.name)
+        cargo_tomls = list(Path(tf.name).rglob("Cargo.toml"))
+        if not cargo_tomls:
+            raise ValueError("No Cargo.toml found")
+        cargo_tomls.sort(
+            key=lambda x: len(str(x))
+        )  # shortest path first, just like search_and_extract_from_archive
+        cargo_toml = cargo_tomls[0]
+        subprocess.check_call(
+            [
+                "nix",
+                "shell",
+                "github:/nixos/nixpkgs/master#cargo",
+                "-c",
+                "cargo",
+                "check",
+            ],
+            cwd=cargo_toml.parent,
+        )
+        return (cargo_toml.with_name("Cargo.lock")).read_text()
+
+
+class MaturinBitRot(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, rules_here):
+        if (
+            "The following metadata fields in `package.metadata.maturin` section of Cargo.toml are removed since maturin 0.14.0"
+            in drv_log
+        ):
+            src = get_src(drv)
+            cargo_toml_path = search_in_archive(src, "Cargo.toml")
+            return "/".join(cargo_toml_path.split("/")[1:])
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutput(
+            arguments=["helpers"],
+            src_attrset_parts={
+                "postPatch": f"""
+                ${{helpers.tomlremove}} {opts} package.metadata.maturin
+        """
+            },
+        )
 
 
 class Enum34(Rule):
@@ -742,4 +907,60 @@ class QTDontWrap(Rule):
         return RuleOutput(
             wheel_attrset_parts={"dontWrapQtApps": True},
             src_attrset_parts={"dontWrapQtApps": True},
+        )
+
+
+class MissingSetParts:
+    """When you need something that's not in the pyproject.toml or default set yet.
+
+    This isn't actually a rule, since we run it on stderr, not on a derivation log
+
+    """
+
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        if opts is None:
+            opts = {}
+        if re.search("attribute '[^']+' missing", drv_log):
+            log.warn("Missing attribute in derivation - trying to patch it in")
+            # I am looking for final.something where in the next line there's a ^ pointing iat it.
+            for hit in re.finditer("final\.[a-z0-9A-Z-]+", drv_log):
+                log.debug(f"Found a hit {hit}")
+                last_newline = max(0, drv_log.rfind("\n", 0, hit.span()[0]) + 1)
+                next_newline = drv_log.find("\n", hit.span()[1])
+                this_line = drv_log[last_newline:next_newline]
+                eol = drv_log.find("\n", next_newline + 1)
+                if eol == -1:
+                    eol = None
+                next_line = drv_log[next_newline + 1 : eol]
+                caret_pos = next_line.find("^")
+                if hit.span()[0] - last_newline == caret_pos:
+                    log.info("Hit hat a caret (^) on it")
+                    text = drv_log[hit.span()[0] : hit.span()[1]][6:]
+                    opts[text] = ""
+        if opts:
+            return opts
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutput(dep_constraints=opts)
+
+
+class KernelHeaders(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        return "apt-get install linux-headers" in drv_log
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutput(
+            arguments=["pkgs"],
+            src_attrset_parts={
+                "postPatch": """
+                if [ -e setup.py ]; then
+                     substituteInPlace setup.py --replace-quiet /usr/include ${pkgs.linuxHeaders}/include
+                fi
+                """,
+                "nativeBuildInputs": [nix_literal("pkgs.linuxHeaders")],
+            },
         )

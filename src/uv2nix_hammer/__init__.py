@@ -1,4 +1,5 @@
 import sys
+import shutil
 import time
 import datetime
 import tarfile
@@ -15,12 +16,14 @@ from pathlib import Path
 import subprocess
 from . import rules
 from .helpers import (
-    get_src,
     drv_to_pkg_and_version,
+    extract_source,
+    get_src,
     log,
-    RuleOutput,
     normalize_python_package_name,
     RuleFunctionOutput,
+    RuleOutput,
+    RuleOutputCopyFile,
     RuleOutputTriggerExclusion,
 )
 
@@ -35,7 +38,7 @@ def write_pyproject_toml(folder, pkg, pkg_version, sdist_or_wheel, python_versio
     (folder / "pyproject.toml").write_text(
         f"""
 [project]
-name = "app"
+name = "uv2nix-hammer-app"
 version = "0.1.0"
 description = "Learn to build {pkg}"
 requires-python = "~={python_version}"
@@ -59,60 +62,22 @@ def write_flake_nix(
     uv2nix_repo,
     hammer_overrides_folder,
     python_version,
-    nixpkgs_version="24.05",
+    nixpkgs_version="master",
 ):
     log.debug(
         f"Writing flake, python_version={python_version}, nixpkgs={nixpkgs_version}"
     )
     flatpythonver = python_version.replace(".", "")
-    (folder / "flake.nix").write_text(f"""
-{{
-  description = "A basic flake using uv2nix";
-  inputs = {{
-      nixpkgs.url = "github:nixos/nixpkgs/{nixpkgs_version}";
-      uv2nix.url = "{uv2nix_repo}";
-      uv2nix.inputs.nixpkgs.follows = "nixpkgs";
-      uv2nix_hammer_overrides.url = "{hammer_overrides_folder.absolute()}";
-      uv2nix_hammer_overrides.inputs.nixpkgs.follows = "nixpkgs";
-  }};
-  outputs = {{
-    nixpkgs,
-    uv2nix,
-    uv2nix_hammer_overrides,
-    ...
-  }}: let
-    inherit (nixpkgs) lib;
+    flake_template = (Path(__file__).parent / "flake.template.nix").read_text()
+    flake_content = (
+        flake_template.replace("{nixpkgs_version}", nixpkgs_version)
+        .replace("{uv2nix_repo}", uv2nix_repo)
+        .replace("{pyproject_nix_repo}", "github:/nix-community/pyproject.nix")
+        .replace("{hammer_overrides_folder}", str(hammer_overrides_folder.absolute()))
+        .replace("{flatpythonver}", flatpythonver)
+    )
 
-    workspace = uv2nix.lib.workspace.loadWorkspace {{workspaceRoot = ./.;}};
-
-    pkgs = import nixpkgs {{system="x86_64-linux"; config.allowUnfree = true;}};
-
-    # Manage overlays
-    overlay = let
-      # Create overlay from workspace.
-      overlay' = workspace.mkOverlay {{
-        sourcePreference = "wheel";
-      }};
-      # work around for packaging must-not-be-a-wheel and is best not overwritten
-      overlay'' = pyfinal: pyprev: let
-        applied = overlay' pyfinal pyprev;
-      in
-        lib.filterAttrs (n: _: n != "packaging" && n != "tomli" && n != "pyproject-hooks" && n != "build" && n != "wheel" && n!= "pathlib") applied;
-
-       overrides = (uv2nix_hammer_overrides.overrides pkgs);
-    in
-      lib.composeExtensions overlay'' overrides;
-
-    python = pkgs.python{flatpythonver}.override {{
-      self = python;
-      packageOverrides = overlay;
-    }};
-  in {{
-    packages.x86_64-linux.default = python.pkgs.app;
-    # TODO: A better mkShell withPackages example.
-  }};
- }}
-""")
+    (folder / "flake.nix").write_text(flake_content)
 
 
 def uv_lock(folder):
@@ -241,30 +206,9 @@ def try_to_fix_infinite_recursion(project_folder):
     # let's see if there's a loop in uv.lock
     # and if there is, add a rule to remove it?
 
-    # raise ValueError("TODO")  # once I know how to fix this
-    cycles = find_cycles_in_uv_lock(project_folder)
-    log.debug("Detected infinite recursion")
-    if not cycles:
-        raise ValueError(
-            "infinite recursion encountered, but no cycles found in uv.lock"
-        )
-    log.debug("Recursion was in uv.lock")
-    uv_lock = toml.loads(Path(project_folder / "uv.lock").read_text())
-    rules = {}
-    seen = set()
-    for cycle in cycles:
-        if frozenset(cycle) in seen:
-            continue
-        first_node = cycle[0]  # Should be enough to remove the first edge. Right?
-        second_node = cycle[1]  # ignore the others edges in the cycle
-        log.debug(f"Fixing by breaking edge {cycle}")
-        packages = [(x["name"], x["version"]) for x in uv_lock["package"]]
-        matching_pkgs = [x for x in packages if x[0] == first_node]
-        first_pkg_version = matching_pkgs[0][1]
-        pkg_tuple = first_node, first_pkg_version
-        rules[pkg_tuple] = {"RemovePropagatedBuildInputs": second_node}
-        # seen.add(frozenset(cycle))
-    return rules
+    raise ValueError(
+        "Pyproject.nix builders should no longer suffer from infinite recursion"
+    )  # once I know how to fix this
 
 
 class InfiniteRecursionError(ValueError):
@@ -291,10 +235,16 @@ def attempt_build(project_folder, attempt_no):
         raise InfiniteRecursionError()
     if "pathlib was removed " in stderr:
         raise NeedsExclusion("pathlib was removed in python 3.5")
+    if "'kaleido' 0.2.1.post1" in stderr:
+        raise AddDependency({"kaleido": "==0.2.1"})
     if "while evaluating the attribute" in stderr:
         raise ValueError(
             "Generated overwrites were not valid nix code (syntax or semantic)"
         )
+    if dep_constraints := rules.MissingSetParts.match(None, stderr, None, None):
+        log.info(f"Adding missing set parts {dep_constraints}")
+        raise AddDependency(dep_constraints)
+
     return attempt_no
 
 
@@ -317,7 +267,7 @@ def load_failures(project_folder, run_no):
     log_file = project_folder / f"run_{run_no}.log"
     raw = log_file.read_text()
     failed_drvs = re.findall("error: builder for '(/nix/store/[^']+)' failed", raw)
-    return {drv: get_nix_log(drv) for drv in failed_drvs}
+    return {drv: get_nix_log(drv) for drv in failed_drvs if not "test-venv" in drv}
 
 
 def load_existing_rules(overrides_folder, pkg, pkg_version):
@@ -333,17 +283,43 @@ class NeedsExclusion(Exception):
     pass
 
 
-def write_combined_rules(path, rules_to_combine, project_folder):
+class AddDependency(Exception):
+    def __init__(self, deps):
+        self.deps = deps
+        Exception.__init__(self)
+
+
+def nix_fmt(path):
+    cmd = ["nix", "fmt"]
+    if path:
+        cmd.append(str(path.absolute()))
+    p = subprocess.Popen(
+        cmd,
+        cwd=path.parent.parent.parent,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout, stderr = p.communicate()
+    if p.returncode != 0:
+        print(stderr)
+        raise ValueError(f"nix fmt failed {path.absolute()}")
+
+
+def write_combined_rules(path, rules_to_combine, project_folder, do_format=False):
     from .nix_format import nix_format, nix_literal, wrapped_nix_literal
+
+    assert project_folder is None or isinstance(project_folder, Path)
 
     function_arguments = set()
     src_attrset_parts = {}
     wheel_attrset_parts = {}
-    pkg_build_inputs = set()
+    pkg_build_systems = set()
+
     further_funcs = []
     requires_nixpkgs_master = False
     dep_constraints = {}
     python_downgrade = None
+    additional_pyproject_reqs = set()
 
     for rule_name in rules_to_combine.keys():
         rule = getattr(rules, rule_name)
@@ -358,9 +334,13 @@ def write_combined_rules(path, rules_to_combine, project_folder):
         elif isinstance(rule_output, RuleOutputTriggerExclusion):
             log.info("Triggered exclusion")
             raise NeedsExclusion(rule_output.reason)
-
+        elif isinstance(rule_output, RuleOutputCopyFile):
+            for f in rule_output.files:
+                log.debug(f"Copying file {f} to {path.with_name(f.name)}")
+                shutil.copy(f, path.with_name(f.name))
         elif isinstance(rule_output, RuleOutput):
-            pkg_build_inputs.update(rule_output.build_inputs)
+            if rule_output.build_systems:
+                pkg_build_systems.update(rule_output.build_systems)
             function_arguments.update(rule_output.arguments)
 
             for src, dest in (
@@ -400,20 +380,26 @@ def write_combined_rules(path, rules_to_combine, project_folder):
                 f"rule's apply output was not a RuleOutput or RuleFunctionOutput)"
             )
 
-    if pkg_build_inputs:
+    if pkg_build_systems:
         function_arguments.add("final")
+        function_arguments.add("resolveBuildSystem")
 
-    pkg_build_inputs = [nix_literal("final." + x) for x in pkg_build_inputs]
-    if pkg_build_inputs and src_attrset_parts.get("nativeBuildInputs", []):
+    pkg_build_systems = {x: [] for x in pkg_build_systems}
+    if pkg_build_systems and src_attrset_parts.get("nativeBuildInputs", []):
         src_attrset_parts["nativeBuildInputs"] = nix_literal(
             "old.nativeBuildInputs or [] ++ "
             + nix_format(src_attrset_parts["nativeBuildInputs"])
             + " ++ "
-            + nix_format(pkg_build_inputs)
+            + "( resolveBuildSystem "
+            + nix_format(pkg_build_systems)
+            + ")"
         )
-    elif pkg_build_inputs:
+    elif pkg_build_systems:
         src_attrset_parts["nativeBuildInputs"] = nix_literal(
-            "old.nativeBuildInputs or [] ++ " + nix_format(pkg_build_inputs)
+            "old.nativeBuildInputs or [] ++ "
+            + "( resolveBuildSystem "
+            + nix_format(pkg_build_systems)
+            + ")"
         )
     elif src_attrset_parts.get("nativeBuildInputs", []):
         src_attrset_parts["nativeBuildInputs"] = nix_literal(
@@ -440,6 +426,7 @@ def write_combined_rules(path, rules_to_combine, project_folder):
     if "env" in src_attrset_parts and not src_attrset_parts["env"]:
         del src_attrset_parts["env"]
 
+    # log.info(f"pkg_build_systems {pkg_build_systems}")
     src_body = nix_format(src_attrset_parts)
     wheel_body = nix_format(wheel_attrset_parts)
     funcs = []
@@ -483,35 +470,23 @@ def write_combined_rules(path, rules_to_combine, project_folder):
             head = "{...}"
 
         path.write_text(head + out_body)
-        p = subprocess.Popen(
-            ["nix", "fmt", str(path.absolute())],
-            cwd=path.parent.parent.parent,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        stdout, stderr = p.communicate()
-        if p.returncode != 0:
-            print(stderr)
-            raise ValueError(f"nix fmt failed {path.absolute()}")
+        if do_format:
+            nix_format(path)
+    else:
+        print("no body")
 
-    if dep_constraints:
+    if dep_constraints and project_folder is not None:
         extend_pyproject_toml_with_dep_constraints(
             dep_constraints, project_folder / "pyproject.toml"
         )
-    if python_downgrade:
+    if python_downgrade and project_folder is not None:
         downgrade_python(python_downgrade, project_folder / "pyproject.toml")
+    if additional_pyproject_reqs and project_folder is not None:
+        extend_pyproject_toml_with_dep_constraints(
+            additional_pyproject_reqs, project_folder / "pyproject.toml"
+        )
 
     return requires_nixpkgs_master, python_downgrade
-
-
-def extend_pyproject_toml_with_dep_constraints(dep_constraints, pyproject_toml_path):
-    input = toml.loads(pyproject_toml_path.read_text())
-    for k, v in dep_constraints.items():
-        input["project"]["dependencies"].append(f"{k}{v}")
-    pyproject_toml_path.write_text(toml.dumps(input))
-    uv_lock(
-        pyproject_toml_path.parent,
-    )
 
 
 def downgrade_python(python_version, pyproject_toml_path):
@@ -528,6 +503,16 @@ def downgrade_python(python_version, pyproject_toml_path):
     #                                  f'pkgs.python{flat_py_version}')
     # assert flake_input != flake_output
     # pyproject_toml_path.with_name('flake.nix').write_text(flake_output)
+
+
+def extend_pyproject_toml_with_dep_constraints(dep_constraints, pyproject_toml_path):
+    input = toml.loads(pyproject_toml_path.read_text())
+    for k, v in dep_constraints.items():
+        input["project"]["dependencies"].append(f"{k}{v}")
+    pyproject_toml_path.write_text(toml.dumps(input))
+    uv_lock(
+        pyproject_toml_path.parent,
+    )
 
 
 def check_for_wheel_build(drv):
@@ -549,6 +534,8 @@ def detect_rules(project_folder, overrides_folder, failures):
     rules_so_far = {}
     for drv, drv_log in failures.items():
         pkg_tuple = drv_to_pkg_and_version(drv)
+        if not pkg_tuple[0]:
+            raise ValueError(f"extracted empty pkg name from {drv}")
         if pkg_tuple[0] in (
             "bootstrap-packaging",
             "bootstrap-tomli",
@@ -572,6 +559,7 @@ def detect_rules(project_folder, overrides_folder, failures):
                 if opts := rule.match(
                     drv, drv_log, copy_if_non_value(old_opts), rules_here.copy()
                 ):
+                    # log.debug(f"Got back for rule {rule} -value: {repr(opts)}")
                     rules_here[rule_name] = opts
                     if opts != old_opts or opts and hasattr(rule, "always_reapply"):
                         any_applied = True
@@ -579,12 +567,16 @@ def detect_rules(project_folder, overrides_folder, failures):
                             f"Rule hit! {rule_name} in {pkg_tuple}}}. Now: {opts} - was: {old_opts}"
                         )
                         if hasattr(rule, "extract"):
-                            rule.extract(
-                                drv,
-                                overrides_folder
-                                / "overrides"
-                                / pkg_tuple[0]
-                                / pkg_tuple[1],
+                            log.warning(f"Had extract {rule}")
+                            rules_here[rule_name] = (
+                                rules_here[rule_name],
+                                rule.extract(
+                                    drv,
+                                    overrides_folder
+                                    / "overrides"
+                                    / pkg_tuple[0]
+                                    / pkg_tuple[1],
+                                ),
                             )
 
         rules_so_far[pkg_tuple] = rules_here
@@ -677,7 +669,7 @@ def clear_existing_overrides(
 
 def get_parser():
     p = argparse.ArgumentParser(
-        prog="uv2nix_hammer",
+        prog="uv2nix-hammer",
         description="Autogenerate overrides for uv2nix usage",
         epilog="Because the existance of nails implies the existance of at least one hammer",
     )
@@ -730,31 +722,54 @@ def get_parser():
         help="Cache folder to store pypi lookups etc. Defaults to .uv2nix_hammer_cache",
     )
 
+    p.add_argument(
+        "-s",
+        "--override_source",
+        action="store",
+        help="Url for the flake repository with the uv2nix_hammer_overrides",
+        default="https://github.com/TyberiusPrime/uv2nix_hammer_overrides",
+    )
+
     return p
 
 
 def extract_sources(src_folder, failures):
     for drv in failures:
         pkg, version = drv_to_pkg_and_version(drv)
-        src = get_src(drv)
         (src_folder / pkg / version).mkdir(exist_ok=True, parents=True)
-        if src.endswith(".tar.gz"):
-            with tarfile.open(src) as tf:
-                tf.extractall(src_folder / pkg / version)
-        elif src.endswith(".zip"):
-            with zipfile.ZipFile(src) as zf:
-                zf.extractall(src_folder / pkg / version)
-        elif src.endswith(".whl"):
-            pass
-        else:
-            log.warn(f"Unknown archive type, not unpacked {src}")
+        src = get_src(drv)
+        extract_source(src, (src_folder / pkg / version))
+
+
+def apply_all_manual_overrides(overrides_folder):
+    """We need to make sure all manual overrides are
+    in place - there are packages that don't fail without the overrides
+    but still need files deleted, and this is the way to get that done"""
+    for pkg_dir in sorted((
+        x for x in Path(overrides_folder / "manual_overrides").iterdir() if x.is_dir()
+    )):
+        for version_dir in sorted((x for x in pkg_dir.iterdir() if x.is_dir())):
+            if (version_dir / "default.nix").exists():
+                pkg = pkg_dir.name
+                version = version_dir.name
+                rules_so_far = load_existing_rules(overrides_folder, pkg, version)
+                rules_so_far["ManualOverrides"] = (
+                    f"__file__:{pkg}/{version}/default.nix"
+                )
+                target_path = (
+                    overrides_folder / "overrides" / pkg / version / "default.nix"
+                )
+                log.debug(f"Preloading manual overrides for {pkg}=={version} into {target_path}")
+                target_path.parent.mkdir(exist_ok=True, parents=True)
+                write_combined_rules(target_path, rules_so_far, None)
+                toml.dump(rules_so_far, open(target_path.with_name("rules.toml"),'w'))
 
 
 def main():
     args = get_parser().parse_args()
     sdist_or_wheel = "wheel" if args.wheel else "sdist"  # the one we put into flake.nix
 
-    overrides_source = "https://github.com/TyberiusPrime/uv2nix_hammer_overrides"
+    overrides_source = args.override_source
     uv2nix = "github:/adisbladis/uv2nix"
 
     cache_folder = Path(args.cache_folder or ".uv2nix_hammer_cache")
@@ -805,6 +820,8 @@ def main():
             p = Path(args.manual_overrides_source_folder) / "manual_overrides"
         else:
             p = Path(args.manual_overrides_source_folder)
+        if not p.exists():
+            raise ValueError(f"manual_overrides_source_folder {p} does not exist")
         assert p.name == "manual_overrides"
         print(
             [
@@ -824,11 +841,12 @@ def main():
                 "--info=progress2",
             ]
         )
+        apply_all_manual_overrides(overrides_folder)
 
     if args.rewrite:
-        print(f"rust rewriting rules for {target_pkg}=={target_pkg_version}")
+        log.info(f"rust rewriting rules for {target_pkg}=={target_pkg_version}")
         rules_here = load_existing_rules(
-            overrides_folder, target_pkg, target_pkg_version, False
+            overrides_folder, target_pkg, target_pkg_version
         )
         if not rules_here:
             raise ValueError("No rules")
@@ -901,6 +919,12 @@ def main():
                         continue
                     else:
                         raise
+                except AddDependency as e:
+                    log.warn("Adding dep from AddDependency")
+                    extend_pyproject_toml_with_dep_constraints(
+                        e.deps, project_folder / "pyproject.toml"
+                    )
+                    continue
                 except ValueError:
                     console.print_exception(show_locals=True)
                     break
@@ -920,6 +944,11 @@ def main():
                 attempt_no += 1
         except NeedsExclusion:
             raise  # the helper will read it.
+        except Exception as e:
+            success = False
+            log.error("Exception in attempt_to_build loop")
+            log.error(f"{e}")
+            console.print_exception(show_locals=True)
 
         if success:
             subprocess.run(
@@ -1002,3 +1031,33 @@ def main_find_infinite_recursion():
     import networkx
 
     print(find_cycles_in_uv_lock("."))
+
+
+def get_parser_rewrite_all():
+    p = argparse.ArgumentParser(
+        prog="uv2nix-hammer-rewrite-all",
+        description="Rewrite all overrides from their rules.",
+        epilog="",
+    )
+
+
+def main_rewrite_all():
+    parser = get_parser_rewrite_all()
+    args = get_parser().parse_args()
+    target_folder = Path(".")
+    overrides_folder = target_folder / "overrides"
+    if not overrides_folder.exists():
+        raise ValueError("run from uv2nix_hammer_overrides checkout folder")
+
+    rules.manual_rule_path = target_folder / "manual_overrides"
+    for pkg_folder in (x for x in overrides_folder.iterdir() if x.is_dir()):
+        pkg = pkg_folder.name
+        if pkg == "jaeger-client":
+            continue
+        for version_folder in (x for x in pkg_folder.iterdir() if x.is_dir()):
+            version = version_folder.name
+            try:
+                rules_here = load_existing_rules(target_folder, pkg, version)
+            except toml.TomlDecodeError:
+                print(rules_here)
+            write_combined_rules(path.with_name("default.nix"), rules_here, None)

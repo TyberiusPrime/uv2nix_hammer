@@ -21,7 +21,10 @@ def drv_to_pkg_and_version(drv):
     nix_name = drv.split("/")[-1]
     parts = nix_name[:-4].rsplit("-")
     version = parts[-1]
-    pkg = "-".join(parts[2:-1])
+    # if 'python' in parts[1]: # changed with pyproject.nix buidls
+    #     pkg = "-".join(parts[2:-1])
+    # else:
+    pkg = "-".join(parts[1:-1])
     pkg_tuple = (pkg, version)
     return pkg_tuple
 
@@ -29,6 +32,30 @@ def drv_to_pkg_and_version(drv):
 def extract_pyproject_toml_from_archive(src_path):
     return toml.loads(search_and_extract_from_archive(src_path, "pyproject.toml"))
 
+
+def search_in_archive(src_path, filename):
+    if src_path.endswith(".tar.gz"):
+        tf = tarfile.open(src_path, "r:gz")
+        candidates = []
+        for fn in tf.getnames():
+            if fn.endswith(filename):
+                candidates.append(fn)
+        candidates.sort(key=lambda x: len(x))
+        if not candidates:
+            raise KeyError(f"no {filename}")
+        log.debug(f"Found {candidates[0]} for {filename}")
+        return candidates[0]
+    elif src_path.endswith(".zip"):
+        # todo: should we not search in this as well?
+        # if so, fix search_and_extract_from_archive as well
+        with zipfile.ZipFile(src_path) as zf:
+            try:
+                with zf.open(filename) as f:
+                    return filename
+            except KeyError:
+                raise KeyError(f"no {filename}")
+    else:
+        raise ValueError("not an archive")
 
 def search_and_extract_from_archive(src_path, filename):
     """Read a file from archive and return it's contents.
@@ -83,7 +110,8 @@ def get_src(drv):
 class RuleOutput:
     def __init__(
         self,
-        build_inputs=[],
+        *,
+        build_systems=None,
         arguments=[],
         src_attrset_parts={},
         wheel_attrset_parts={},
@@ -91,7 +119,7 @@ class RuleOutput:
         dep_constraints=None,
         python_downgrade=None,
     ):
-        self.build_inputs = build_inputs
+        self.build_systems = build_systems
         self.arguments = arguments
         self.src_attrset_parts = src_attrset_parts
         self.wheel_attrset_parts = wheel_attrset_parts
@@ -101,7 +129,7 @@ class RuleOutput:
 
 
 class RuleFunctionOutput:
-    def __init__(self, nix_func, args = []):
+    def __init__(self, nix_func, args=[]):
         self.inner = nix_func
         self.args = args
 
@@ -109,6 +137,11 @@ class RuleFunctionOutput:
 class RuleOutputTriggerExclusion:
     def __init__(self, reason):
         self.reason = reason
+
+
+class RuleOutputCopyFile:
+    def __init__(self, files):
+        self.files = files
 
 
 class Rule:  # marker class for rules
@@ -131,3 +164,16 @@ def get_release_date(pkg, version):
 
 def normalize_python_package_name(pkg):
     return re.sub(r"[-_.]+", "-", pkg).lower()
+
+
+def extract_source(src, target_folder):
+    if src.endswith(".tar.gz"):
+        with tarfile.open(src) as tf:
+            tf.extractall(target_folder)
+    elif src.endswith(".zip"):
+        with zipfile.ZipFile(src) as zf:
+            zf.extractall(target_folder)
+    elif src.endswith(".whl"):
+        pass
+    else:
+        log.warn(f"Unknown archive type, not unpacked {src}")
