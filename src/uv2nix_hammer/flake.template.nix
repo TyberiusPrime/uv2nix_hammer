@@ -33,7 +33,7 @@
       overlay = workspace.mkPyprojectOverlay {
         sourcePreference = "wheel";
       };
-      pyprojectOverrides = uv2nix_hammer_overrides.overrides pkgs;
+      pyprojectOverrides = uv2nix_hammer_overrides.overrides_strict pkgs;
       #pyprojectOverrides = final: prev: {};
       interpreter = pkgs.python{flatpythonver};
       spec = {

@@ -108,7 +108,7 @@ class BuildSystems(Rule):
                 opts.append("pycodestyle")
             if "isort" in lines:
                 opts.append("isort")
-            if "cython" in lines or "Cython" in lines:
+            if "cython" in lines or "Cython" in lines or "Cython>=" in drv_log:
                 opts.append("cython")
             if "pip" in lines:
                 opts.append("pip")
@@ -116,12 +116,36 @@ class BuildSystems(Rule):
                 opts.append("pbr")
             if "cffi" in lines:
                 opts.append("cffi")
+            if "numpy" in lines:
+                opts.append("numpy")
             if "wheel" in lines:
                 opts.append("wheel")
+            if "torch" in lines:
+                opts.append("torch")
+            if "ninja" in lines:
+                opts.append("ninja")
+
         if "cppyy-cling" in drv_log:
             opts.append("cppyy-cling")
         if "cppyy-backend" in drv_log:
             opts.append("cppyy-backend")
+        if "ModuleNotFoundError: No module named 'numpy'" in drv_log:
+            opts.append("numpy")
+
+        if "ModuleNotFoundError: No module named 'pandas'" in drv_log:
+            opts.append("pandas")
+        if "ModuleNotFoundError: No module named 'convertdate'" in drv_log:
+            opts.append("convertdate")
+        if "ModuleNotFoundError: No module named 'lunarcalendar'" in drv_log:
+            opts.append("lunarcalendar")
+        if "ModuleNotFoundError: No module named 'holidays'" in drv_log:
+            opts.append("holidays")
+        if "ModuleNotFoundError: No module named 'toml'" in drv_log:
+            opts.append("toml")
+        if (
+            "ModuleNotFoundError: No module named 'Cython'" in drv_log
+        ):  # if you're so old that you don't have a pyproject.toml, but non managed build requirements, you probably also want the old cython,
+            opts.append("cython")
         opts = [x for x in opts if x != pkg]
 
         if (
@@ -138,6 +162,13 @@ class BuildSystems(Rule):
 
         while "cython" in opts and "cython_0" in opts:
             opts.remove("cython")
+        if (
+            "could not find git for clone of pybind11-populate" in drv_log
+            or "pybind11Config.cmake" in drv_log
+        ):
+            opts.append("pybind11")
+        if "No such file or directory: 'cmake'" in drv_log:
+            opts.append("cmake")
         filtered_build_systems = [
             "hatch-docstring-description",  # not in nixpkgs and useless-for-our-purposes-metadata anyway
             "setuptools-scm-git-archive",  # marked as broken in nixpkgs, plugin is obsolete, setuptools-scm can do it.
@@ -197,6 +228,8 @@ class NativeBuildInputs(Rule):
             opts = []
 
         def add_pkgs(x):
+            if x.startswith("~literal:!"):
+                return x[11:]
             do_add = not "." in x
             do_add |= ".dev" in x
             do_add |= "cudaPackages." in x
@@ -214,6 +247,8 @@ class NativeBuildInputs(Rule):
             ("Did not find pkg-config", "pkg-config"),
             ("pkgconfig", "pkg-config"),
             ("pkg-config not found", "pkg-config"),
+            ("pkg-config: not found", "pkg-config"),
+            ("missing: PKG_CONFIG_EXECUTABLE", "pkg-config"),
             ("No such file or directory: 'pkg-config'", "pkg-config"),
             (
                 "The headers or library files could not be found for zlib",
@@ -224,6 +259,7 @@ class NativeBuildInputs(Rule):
             ('"pkg-config" command could not be found.', "pkg-config"),
             ("CMake must be installed to build from source.", "cmake"),
             ("CMake is not installed on your system!", "cmake"),
+            ("Missing CMake executable", "cmake"),
             ("Cannot find CMake executable", "cmake"),
             ("checking for GTK+ - version >= 3.0.0... no", ["gtk3", "pkg-config"]),
             ("systemd/sd-daemon.h: No such file", "pkg-config"),  # cysystemd
@@ -261,6 +297,7 @@ class NativeBuildInputs(Rule):
             ("sndfile.h: No such file", ["pkgs.libsndfile.dev", "pkg-config"]),
             ("No such file or directory: 'gdal-config'", "gdal"),
             ("No such file or directory: 'which'", "which"),
+            ("which: not found", "which"),
             ("#include <xc.h>", "libxc"),
             ("#include <notmuch.h>", "notmuch"),
             (
@@ -271,6 +308,25 @@ class NativeBuildInputs(Rule):
             ("PyAPI_FUNC(PyCodeObject *) PyCode_New(", "final.cython_0"),
             ("pcap.h: No such file", "libpcap"),
             ("lzo1.h: No such file", "lzo"),
+            ("glib.h: No such file", ["pkgs.glib.dev", "pkg-config"]),
+            ("jpeglib.h: No such file", "libjpeg"),
+            ("png.h: No such file", "libpng"),
+            ("tiffio.h: No such file", "libtiff"),
+            ("unrar/dll.hpp: No such", "unrar"),
+            ("iwlib.h: No such file", "wirelesstools"),
+            ("command 'swig' failed: No such file or directory", "swig"),
+            (
+                "Boost Python3 library not found",
+                nix_literal(
+                    "(pkgs.boost.override {python = final.python; numpy=final.numpy; enablePython=true;})"
+                ),
+            ),
+            ("Could NOT find GLIB2", "glib"),
+            ("No package 'gfal2' found", "gfal2"),
+            ("Package 'libpcre2-8', required by 'glib-2.0', not found", "pcre2"),
+            ("mpfr.h: No such file", "mpfr"),
+            ("fplll/fplll_config.h: No such file", "fplll_20160331"),
+            ("OSError: mariadb_config not found.", "libmysqlclient"),
             # (
             #     re.compile(
             #         "do not know how to unpack source archive [^.]+.zip",
@@ -305,6 +361,7 @@ class NativeBuildInputs(Rule):
         args = sorted(
             set(x[len("~literal:!:") :].split(".")[0] for x in opts if "." in x)
         )
+        args = [x for x in args if x[0] != "("]
         return RuleOutput(arguments=args, src_attrset_parts=src_attrset)
 
 
@@ -406,6 +463,37 @@ class BuildInputs(Rule):
             ("libpyvex.so -> not found", "final.pyvex"),  # wheel doesn't declare it...
             ("libpam.so.0 -> not found!", "linux-pam"),
             ("libcrypt.so.1 -> not found!", "libxcrypt-legacy"),
+            ("libboost_chrono.so.1.83.0 -> not found!", "boost183"),
+            ("libboost_filesystem.so.1.83.0 -> not found!", "boost183"),
+            ("libboost_python312.so.1.83.0 -> not found!", "boost183"),
+            ("libboost_serialization.so.1.83.0 -> not found!", "boost183"),
+            ("libboost_system.so.1.83.0 -> not found!", "boost183"),
+            (
+                "libboost_python312.so.1.83.0 -> not found!",
+                nix_literal("""
+             (pkgs.boost183.override {
+                 python = final.python;
+                 numpy = final.numpy;
+                 enablePython = true;
+             })
+             """),
+            ),
+            ("libconsole_bridge.so.1.0 -> not found!", "console-bridge"),
+            ("libeigenpy.so -> not found!", "final.eigenpy"),
+            ("libhpp-fcl.so -> not found!", "hpp-fcl"),
+            ("liboctomap.so -> not found!", "octomap"),
+            ("liboctomath.so -> not found!", "octomap"),
+            ("libtinyxml.so -> not found!", "tinyxml"),
+            ("liburdfdom_model.so.3.0 -> not found!", "urdfdom"),
+            ("liburdfdom_sensor.so.3.0 -> not found!", "urdfdom"),
+            ("liburdfdom_world.so.3.0 -> not found!", "urdfdom"),
+            ("libassimp.so.5 -> not found!", "assimp"),
+            ("libqhull_r.so.8.0 -> not found!", "qhull"),
+            ("libudev.so.1 -> not found!", "udev"),
+            ("glib.h: No such file", "glib"),
+            ("crack.h: No such file", "cracklib"),
+            ("libjvm.so", "openjdk"),
+            ("udunits2.h: No such file", "udunits"),
             # (" RequiredDependencyException: pangocairo", "pango"),
         ]:
             if k in drv_log:
@@ -434,18 +522,30 @@ class BuildInputs(Rule):
         needs_master = nix_literal("pkgs.cudaPackages.cudnn") in opts
         if needs_master:
             log.debug("Switching to master because of cuda")
+        arguments = {"pkgs"}
         fixups = ""
         for pkg in opts:
             if pkg.startswith("~literal:!:final."):
                 pkg_str = pkg[len("~literal:!:final.") :]
-                fixups += f"addAutoPatchelfSearchPath ${{final.{pkg_str}}}/${{final.python.sitePackages}}/{pkg_str}/lib\n"
+                cmeel_packages = ["eigenpy"]
+                if pkg_str in cmeel_packages:
+                    # no clue why the place the .so files there.
+                    fixups += f"addAutoPatchelfSearchPath ${{final.{pkg_str}}}/${{final.python.sitePackages}}/cmeel.prefix/${{final.python.sitePackages}}\n"
+                else:
+                    fixups += f"addAutoPatchelfSearchPath ${{final.{pkg_str}}}/${{final.python.sitePackages}}/{pkg_str}/lib\n"
+                arguments.add("final")
+            if pkg == "~literal:!:pkgs.openjdk":
+                pkg_str = pkg[len("~literal:!:") :]
+                fixups += f"addAutoPatchelfSearchPath ${{{pkg_str}}}/lib/openjdk/lib/server/\n"
+            if "final." in pkg:
+                arguments.add("final")
         src_attr_parts = {"buildInputs": opts, "env": env}
         wheel_attr_parts = {"buildInputs": opts}
         if fixups:
             wheel_attr_parts["preFixup"] = fixups
             # src_attr_parts["libs"] = libs
         return RuleOutput(
-            arguments=["pkgs"],
+            arguments=sorted(arguments),
             src_attrset_parts=src_attr_parts,
             wheel_attrset_parts=wheel_attr_parts,
             # nixpkgs 24.05 has no cudnn 9.x
@@ -471,7 +571,7 @@ class BuildInputs(Rule):
 #             )
 
 
-class MasterForTorch(Rule):
+class MasterForTorch(Rule):  # torch requires nixpkgs master.
     always_reapply = True
 
     @staticmethod
@@ -571,7 +671,7 @@ class VersioneerBitRot(Rule):
             arguments=["final", "pkgs"],
             src_attrset_parts={
                 "postPatch": nix_literal("""
-                 pkgs.lib.optionalString (!(final.pythonOlder "3.12")) 
+                 pkgs.lib.optionalString (!(final.pythonOlder "3.12"))
                  ''
                  if [ -e setup.py ]; then
                       substituteInPlace setup.py --replace-quiet "versioneer.get_version()" "'${old.version}'" \\
@@ -584,30 +684,30 @@ class VersioneerBitRot(Rule):
         )
 
 
-class RemovePropagatedBuildInputs(Rule):
-    @staticmethod
-    def match(drv, drv_log, opts, _rules_here):
-        pass
+# class RemovePropagatedBuildInputs(Rule):
+#     @staticmethod
+#     def match(drv, drv_log, opts, _rules_here):
+#         pass
 
-    @staticmethod
-    def apply(opts):
-        return RuleOutput(
-            arguments=["final", "helpers", "pkgs"],
-            src_attrset_parts={
-                "propagatedBuildInputs": nix_literal(f"""
-                  (helpers.removePackagesByName
-                    (old.propagatedBuildInputs or [ ])
-                    (pkgs.lib.optionals (final ? {opts}) [ final.{opts} ]))
-            """)
-            },
-            wheel_attrset_parts={
-                "propagatedBuildInputs": nix_literal(f"""
-                  (helpers.removePackagesByName
-                    (old.propagatedBuildInputs or [ ])
-                    (pkgs.lib.optionals (final ? {opts}) [ final.{opts} ]))
-            """)
-            },
-        )
+#     @staticmethod
+#     def apply(opts):
+#         return RuleOutput(
+#             arguments=["final", "helpers", "pkgs"],
+#             src_attrset_parts={
+#                 "propagatedBuildInputs": nix_literal(f"""
+#                   (helpers.removePackagesByName
+#                     (old.propagatedBuildInputs or [ ])
+#                     (pkgs.lib.optionals (final ? {opts}) [ final.{opts} ]))
+#             """)
+#             },
+#             wheel_attrset_parts={
+#                 "propagatedBuildInputs": nix_literal(f"""
+#                   (helpers.removePackagesByName
+#                     (old.propagatedBuildInputs or [ ])
+#                     (pkgs.lib.optionals (final ? {opts}) [ final.{opts} ]))
+#             """)
+#             },
+#         )
 
 
 class RefindBuildDirectory(Rule):
@@ -621,10 +721,13 @@ class RefindBuildDirectory(Rule):
     @staticmethod
     def apply(opts):
         return RuleOutput(
+            arguments=["pkgs"],
             src_attrset_parts={
                 "preBuild": """
                 cd /build
-                cd ${old.pname}-${old.version}
+                # find the first directory containing either pyproject.toml or setup.py
+                buildDir=$(find . -maxdepth 1 -type d -exec test -e "{}/pyproject.toml" -o -e "{}/setup.py" \; -print -quit)
+                cd $buildDir
                 """
             },  # will fail if there's multiple directories
         )
@@ -693,6 +796,8 @@ class DowngradePython(Rule):
             return "3.11"
         if "only versions >=3.6,<3.10 are supported." in drv_log:
             return "3.9"
+        if "Cannot install on Python version 3.10." in drv_log:
+            return "3.9"
         if "pygame" in drv:
             pkg_tuple = drv_to_pkg_and_version(drv)
             version = pkg_tuple[1]
@@ -757,7 +862,7 @@ class Rust(Rule):
               pkgs.lib.optionalAttrs (old.format or "sdist" != "wheel") (
               helpers.standardMaturin {
               furtherArgs = {
-                  postPatch = old.postPatch or "" + ''
+                  postPatch = ''
                   cp ${./Cargo.lock} Cargo.lock
                   '';
               };
@@ -835,7 +940,7 @@ class MaturinBitRot(Rule):
         )
 
 
-class Enum34(Rule):
+class Enum34(Rule):  # a older variant of PythonTooNew
     @staticmethod
     def match(drv, drv_log, opts, _rules_here):
         if "module 'enum' has no attribute 'global_enum'" in drv_log:
@@ -923,7 +1028,7 @@ class MissingSetParts:
             opts = {}
         if re.search("attribute '[^']+' missing", drv_log):
             log.warn("Missing attribute in derivation - trying to patch it in")
-            # I am looking for final.something where in the next line there's a ^ pointing iat it.
+            # I am looking for final.something where in the next line there's a ^ pointing at it.
             for hit in re.finditer("final\.[a-z0-9A-Z-]+", drv_log):
                 log.debug(f"Found a hit {hit}")
                 last_newline = max(0, drv_log.rfind("\n", 0, hit.span()[0]) + 1)
@@ -962,5 +1067,22 @@ class KernelHeaders(Rule):
                 fi
                 """,
                 "nativeBuildInputs": [nix_literal("pkgs.linuxHeaders")],
+            },
+        )
+
+
+class Udunits(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        return "Require to set UDUNITS2_XML_PATH" in drv_log
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutput(
+            arguments=["pkgs"],
+            src_attrset_parts={
+                "env": {
+                    "UDUNITS2_XML_PATH": "${pkgs.udunits}/share/udunits/udunits2.xml"
+                },
             },
         )
