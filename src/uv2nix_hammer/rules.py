@@ -112,7 +112,12 @@ class BuildSystems(Rule):
                 opts.append("isort")
             if "cython>=3" in from_here:
                 opts.append("cython")
-            elif "cython" in lines or "Cython" in lines or "Cython>=" in from_here:
+            elif (
+                "cython" in lines
+                or "Cython" in lines
+                or "Cython>=" in from_here
+                or "cython>=" in from_here
+            ):
                 opts.append("cython")
             if "pip" in lines:
                 opts.append("pip")
@@ -139,7 +144,6 @@ class BuildSystems(Rule):
                 opts.append("pbr")
             if "certifi>" in from_here:
                 opts.append("certifi")
-
             if "versiontools>" in from_here:
                 opts.append("versiontools")
         if "cppyy-cling" in drv_log:
@@ -149,6 +153,7 @@ class BuildSystems(Rule):
         if (
             "ModuleNotFoundError: No module named 'numpy'" in drv_log
             or "install requires: 'numpy'" in drv_log
+            or "pip install numpy" in drv_log
         ):
             opts.append("numpy")
         if "ModuleNotFoundError: No module named 'pandas'" in drv_log:
@@ -163,6 +168,8 @@ class BuildSystems(Rule):
             opts.append("toml")
         if "ModuleNotFoundError: No module named 'cffi'" in drv_log:
             opts.append("cffi")
+        if "ModuleNotFoundError: No module named 'pygments'" in drv_log:
+            opts.append("pygments")
         if "No module named 'pybind11'" in drv_log:
             if not "pybind11" in opts:
                 opts.append("pybind11")
@@ -379,6 +386,8 @@ class NativeBuildInputs(Rule):
             ("OSError: mariadb_config not found.", "libmysqlclient"),
             ("mpi.h: No such file", "mpi"),
             ("autoreconf: not found", "autoconf"),
+            ("No such file or directory: 'autoreconf'", "autoconf"),
+            ('Can\'t exec "libtoolize"', "libtool"),
             ('Can\'t exec "aclocal"', "automake"),
             ("Libtool library used but 'LIBTOOL'", "libtool"),
             ("glpk.h: No such file", "glpk"),
@@ -394,6 +403,8 @@ class NativeBuildInputs(Rule):
             ("Eigen/Core: No such file", "eigen"),
             ("No package 'ddjvuapi' found", "djvulibre"),
             ("libmilter/mfapi.h: No such file", "libmilter"),
+            ("Error: pg_config executable not found.", "postgresql.dev"),
+            ("cudaProfiler.h: No such", "cudaPackages.cuda_profiler_api"),
             # ("libxml/xpath.h: No such file or directory", "libxml2"),
             # (
             #     "-lldap_r: No such file",
@@ -610,6 +621,7 @@ class BuildInputs(Rule):
             ("libXft.so.2 -> not found!", "pkgs.xorg.libXft"),
             ("libfontconfig.so.1 -> not found!", "pkgs.fontconfig"),
             ("libXinerama.so.1 -> not found!", "pkgs.xorg.libXinerama"),
+            ("libkrb5.so.3 -> not found!", "krb5"),
             # libcrypto.so.3 -> not found!"
         ]:
             if k in drv_log:
@@ -868,6 +880,20 @@ class Torch(Rule):
         )
 
 
+class DowngradeSetupTools(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        if (
+            "TypeError: canonicalize_version() got an unexpected keyword argument 'strip_trailing_zero'"
+            in drv_log
+        ):
+            return "<71"
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutput(dep_constraints={"numpy": opts})
+
+
 class DowngradeNumpy(Rule):
     """Downgrade numpy when it's a clear >= 2.0 not suppported case"""
 
@@ -887,6 +913,11 @@ class DowngradeNumpy(Rule):
             and "subarray" in drv_log
         ):
             return "<2"  # https://github.com/piskvorky/gensim/issues/3541
+        elif (
+            'origin = find_spec("numpy").origin' in drv_log
+            and "AttributeError: 'NoneType' object has no attribute 'origin" in drv_log
+        ):
+            return "<2"
 
         # or ("numpy/arrayobject.h: No such file" in drv_log)
 
@@ -905,20 +936,25 @@ class DowngradePython(Rule):
     @staticmethod
     def match(drv, drv_log, opts, _rules_here):
         if "3.12" in drv_log and "No module named 'distutils'" in drv_log:
+            log.error("Downgrading Python - distutils")
             return "3.10"
         if "greenlet-1.1.0" in drv_log:
+            log.error("Downgrading Python - greenlet")
             return "3.10"
         if (
             "return kh_float64_hash_func(val.real)^kh_float64_hash_func(val.imag);"
             in drv_log
         ):
+            log.error("Downgrading Python - old pandas")
             return "3.10"  # old pandas 1.5.3
         if "ModuleNotFoundError: No module named 'distutils'" in drv_log:
             return "3.11"
         if "fatal error: longintrepr.h: " in drv_log:
+            log.error("Downgrading Python - longinterpr")
             return "3.10"
         if "AttributeError: fcompiler. Did you mean: 'compiler'?" in drv_log:
             # that's trying to compile numpy 1.22, o
+            log.error("Downgrading Python - fcompiler")
             return "3.10"
         if "ModuleNotFoundError: No module named 'imp'" in drv_log:
             return "3.11"
@@ -942,7 +978,8 @@ class DowngradePython(Rule):
             return "3.9"  # old scipy
         if "requires python >= 3.6 and <=3.10" in drv_log:
             return "3.9"
-        if "eval.h: No such file":
+        if "eval.h: No such file" in drv_log:
+            log.error("Downgrading Python - eval.h")
             return "3.10"
         if (
             "invalid literal for int() with base 10:" in drv_log
@@ -1086,7 +1123,7 @@ class Rust(Rule):
         )
         stdout, stderr = p.communicate()
         if p.returncode != 0:
-             raise ValueError(f"cargo check failed: {stderr.decode('utf-8')}")
+            raise ValueError(f"cargo check failed: {stderr.decode('utf-8')}")
         return (cargo_toml.with_name("Cargo.lock")).read_text()
 
 
