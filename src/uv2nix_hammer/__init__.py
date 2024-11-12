@@ -57,12 +57,15 @@ dependencies = [
     )
 
 
+default_nixpkgs_version = "684a8fe32d4b7973974e543eed82942d2521b738"
+
+
 def write_flake_nix(
     folder,
     uv2nix_repo,
     hammer_overrides_folder,
     python_version,
-    nixpkgs_version="master",
+    nixpkgs_version=default_nixpkgs_version,  # fix for now, there's an issue building the newest uv.
 ):
     log.debug(
         f"Writing flake, python_version={python_version}, nixpkgs={nixpkgs_version}"
@@ -86,7 +89,7 @@ def uv_lock(folder):
             "uv",
             "lock",
             "--no-cache",
-            "--prerelease=allow",
+            "--prerelease=if-necessary-or-explicit",
         ],
         cwd=folder,
     )
@@ -241,7 +244,11 @@ def attempt_build(project_folder, attempt_no):
         cwd=project_folder,
         stderr=(project_folder / f"run_{attempt_no}.log").open("w"),
     )
-    stderr = (project_folder / f"run_{attempt_no}.log").read_bytes().decode('utf-8',errors='replace')
+    stderr = (
+        (project_folder / f"run_{attempt_no}.log")
+        .read_bytes()
+        .decode("utf-8", errors="replace")
+    )
     if "infinite recursion encountered" in stderr:
         raise InfiniteRecursionError()
     if "pathlib was removed " in stderr:
@@ -252,11 +259,26 @@ def attempt_build(project_folder, attempt_no):
         raise AddDependency({"swig": ">0"})
     if "attribute 'cysignals' missing" in stderr:
         raise AddDependency({"cysignals": ">0"})
+    if "attribute 'requests' missing" in stderr:
+        raise AddDependency({"requests": ">0"})
+    if "attribute 'torch' missing" in stderr:
+        raise AddDependency({"torch": ">0"})
+    if "attribute 'versiontools' missing" in stderr:
+        raise AddDependency({"versiontools": ">0"})
+    if "attribute 'versioneer-518' missing" in stderr:
+        raise AddDependency({"versioneer-518": ">0"})
+    if "attribute 'certifi' missing" in stderr:
+        raise AddDependency({"certifi": ">0"})
 
     if "while evaluating the attribute" in stderr:
         raise ValueError(
             "Generated overwrites were not valid nix code (syntax or semantic)"
         )
+    if "No compatible wheel, nor sdist found for package" in stderr:
+        raise NeedsExclusion("No (compatible) wheel nor sdist found")
+    if "OpenSSL 1.1 is reaching its end of life on 2023/09/11" in stderr:
+        raise NeedsExclusion("Needs openssl 1.1 which is EOL")
+
     if dep_constraints := rules.MissingSetParts.match(None, stderr, None, None):
         log.info(f"Adding missing set parts {dep_constraints}")
         raise AddDependency(dep_constraints)
@@ -457,7 +479,7 @@ def write_combined_rules(path, rules_to_combine, project_folder, do_format=False
 
         else:
             funcs.append(
-                f"""old: if ((old.format or "sdist") == "wheel") then {wheel_body} else {src_body}"""
+                f"""old: if ((old.passthru.format or "sdist") == "wheel") then {wheel_body} else {src_body}"""
             )
     funcs.extend(further_funcs)
     if len(funcs) == 1:
@@ -548,7 +570,7 @@ def copy_if_non_value(value):
         return value
 
 
-def detect_rules(project_folder, overrides_folder, failures):
+def detect_rules(project_folder, overrides_folder, failures, current_python):
     """Check which rules we can apply"""
     log.debug(f"Applying rules to {len(failures)} failures")
     any_applied = False
@@ -580,9 +602,21 @@ def detect_rules(project_folder, overrides_folder, failures):
                 if opts := rule.match(
                     drv, drv_log, copy_if_non_value(old_opts), rules_here.copy()
                 ):
-                    # log.debug(f"Got back for rule {rule} -value: {repr(opts)}")
+                    log.debug(
+                        f"Got back for rule {rule} -value: {opts} - old was {old_opts}. Current_python {current_python}"
+                    )
+
                     rules_here[rule_name] = opts
-                    if opts != old_opts or opts and hasattr(rule, "always_reapply"):
+                    if (
+                        (opts != old_opts)
+                        or (opts
+                        and hasattr(rule, "always_reapply"))
+                        or (
+                            isinstance(rule, type)
+                            and issubclass(rule, rules.DowngradePython)
+                            and (opts != current_python)
+                        )
+                    ):
                         any_applied = True
                         log.info(
                             f"Rule hit! {rule_name} in {pkg_tuple}}}. Now: {opts} - was: {old_opts}"
@@ -646,7 +680,6 @@ def write_rules(any_applied, rules_so_far, overrides_folder, project_folder):
 
         collect_and_commit(overrides_folder)
     return requires_nixpkgs_master, python_downgrade
-
 
 
 def collect_overwrites(overrides_folder):
@@ -763,8 +796,11 @@ def extract_sources(src_folder, failures):
     for drv in failures:
         pkg, version = drv_to_pkg_and_version(drv)
         (src_folder / pkg / version).mkdir(exist_ok=True, parents=True)
-        src = get_src(drv)
-        extract_source(src, (src_folder / pkg / version))
+        try:
+            src = get_src(drv)
+            extract_source(src, (src_folder / pkg / version))
+        except KeyError:
+            log.error(f"Failed to extract source for {pkg}=={version}")
 
 
 def apply_all_manual_overrides(overrides_folder):
@@ -779,16 +815,12 @@ def apply_all_manual_overrides(overrides_folder):
             if (version_dir / "default.nix").exists():
                 old = (version_dir / "default.nix").read_text()
             else:
-                old = ''
+                old = ""
             pkg = pkg_dir.name
             version = version_dir.name
             rules_so_far = load_existing_rules(overrides_folder, pkg, version)
-            rules_so_far["ManualOverrides"] = (
-                f"__file__:{pkg}/{version}/default.nix"
-            )
-            target_path = (
-                overrides_folder / "overrides" / pkg / version / "default.nix"
-            )
+            rules_so_far["ManualOverrides"] = f"__file__:{pkg}/{version}/default.nix"
+            target_path = overrides_folder / "overrides" / pkg / version / "default.nix"
             log.debug(
                 f"Preloading manual overrides for {pkg}=={version} into {target_path}"
             )
@@ -907,8 +939,8 @@ def main():
             sdist_or_wheel,
             python_version,
         )
-        if not (project_folder / "uv.lock").exists():
-            uv_lock(project_folder)
+        #if not (project_folder / "uv.lock").exists():
+        uv_lock(project_folder)
         # if not (project_folder / "flake.nix").exists():
         write_flake_nix(project_folder, uv2nix, overrides_folder, python_version)
         gitify(project_folder)
@@ -943,7 +975,7 @@ def main():
                         uv2nix,
                         overrides_folder,
                         python_version if not python_downgrade else python_downgrade,
-                        "master",
+                        default_nixpkgs_version,
                     )
                 try:
                     run_no = attempt_build(project_folder, attempt_no)
@@ -971,7 +1003,10 @@ def main():
                     break
                 failures = load_failures(project_folder, run_no)
                 any_applied, new_rules = detect_rules(
-                    project_folder, overrides_folder, failures
+                    project_folder,
+                    overrides_folder,
+                    failures,
+                    python_version if not python_downgrade else python_downgrade,
                 )
                 requires_nixpkgs_master, python_downgrade = write_rules(
                     any_applied, new_rules, overrides_folder, project_folder

@@ -88,12 +88,20 @@ def search_and_extract_from_archive(src_path, filename):
 
 
 def has_pyproject_toml(drv):
-    src = get_src(drv)
     try:
+        src = get_src(drv)
         extract_pyproject_toml_from_archive(src)
         return True
     except:
         return False
+
+def get_pyproject_toml(drv):
+    src = get_src(drv)
+    try:
+        return extract_pyproject_toml_from_archive(src)
+    except:
+        raise KeyError("no pyproject.toml")
+
 
 
 def get_src(drv):

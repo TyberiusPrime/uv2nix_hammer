@@ -8,7 +8,7 @@ from .helpers import (
     extract_source,
     get_release_date,
     get_src,
-    has_pyproject_toml,
+    get_pyproject_toml,
     log,
     Rule,
     RuleFunctionOutput,
@@ -63,8 +63,8 @@ class BuildSystems(Rule):
         if opts is None:  # no build system yet - read pyproject.toml if available..
             opts = []
             try:
-                src = get_src(drv)
                 try:
+                    src = get_src(drv)
                     pyproject_toml = extract_pyproject_toml_from_archive(src)
                     # log.debug(f"\tgot pyproject.toml for {drv}")
                     opts = list(  # sorting is just before return
@@ -81,7 +81,10 @@ class BuildSystems(Rule):
                     opts = []
             except ValueError:
                 opts = []  # was a wheel
-        if "No module named 'setuptools'" in drv_log:
+        if (
+            "No module named 'setuptools'" in drv_log
+            or "Cannot import 'setuptools.build_meta'" in drv_log
+        ):
             if not "setuptools" in opts:
                 opts.append("setuptools")
         if "No module named pip" in drv_log and not "pip" in opts:
@@ -91,10 +94,8 @@ class BuildSystems(Rule):
             opts.remove("cython")
             opts.append("cython_0")
         if "Missing dependencies:" in drv_log:
-            lines = [
-                x.strip()
-                for x in drv_log[drv_log.find("Missing dependencies:") :].split("\n")
-            ]
+            from_here = drv_log[drv_log.find("Missing dependencies:") :]
+            lines = [x.strip() for x in from_here.split("\n")]
             # log.error(f"Missing dependencies - {drv}")
             if "setuptools-scm" in lines or "setuptools_scm" in lines:
                 opts.append("setuptools-scm")
@@ -102,21 +103,29 @@ class BuildSystems(Rule):
                 opts.append("setuptools-git")
             # if "setuptools-git-version" in drv_log:
             #     opts.append("setuptools-git-version") # currently not in nixpkgs
-            if "pytest-runner" in lines:
+            if "pytest-runner" in from_here:
                 opts.append("pytest-runner")
+
             if "pycodestyle" in lines:
                 opts.append("pycodestyle")
             if "isort" in lines:
                 opts.append("isort")
-            if "cython" in lines or "Cython" in lines or "Cython>=" in drv_log:
+            if "cython>=3" in from_here:
+                opts.append("cython")
+            elif "cython" in lines or "Cython" in lines or "Cython>=" in from_here:
                 opts.append("cython")
             if "pip" in lines:
                 opts.append("pip")
             if "pbr" in lines:
                 opts.append("pbr")
-            if "cffi" in lines:
+            if "cffi" in from_here:
                 opts.append("cffi")
-            if "numpy" in lines:
+            if (
+                "numpy" in lines
+                or "numpy;" in from_here
+                or "numpy>" in from_here
+                or "numpy=" in from_here
+            ):
                 opts.append("numpy")
             if "wheel" in lines:
                 opts.append("wheel")
@@ -124,14 +133,24 @@ class BuildSystems(Rule):
                 opts.append("torch")
             if "ninja" in lines:
                 opts.append("ninja")
+            if "requests" in lines:
+                opts.append("requests")
+            if "pbr>" in from_here:
+                opts.append("pbr")
+            if "certifi>" in from_here:
+                opts.append("certifi")
 
+            if "versiontools>" in from_here:
+                opts.append("versiontools")
         if "cppyy-cling" in drv_log:
             opts.append("cppyy-cling")
         if "cppyy-backend" in drv_log:
             opts.append("cppyy-backend")
-        if "ModuleNotFoundError: No module named 'numpy'" in drv_log:
+        if (
+            "ModuleNotFoundError: No module named 'numpy'" in drv_log
+            or "install requires: 'numpy'" in drv_log
+        ):
             opts.append("numpy")
-
         if "ModuleNotFoundError: No module named 'pandas'" in drv_log:
             opts.append("pandas")
         if "ModuleNotFoundError: No module named 'convertdate'" in drv_log:
@@ -142,18 +161,33 @@ class BuildSystems(Rule):
             opts.append("holidays")
         if "ModuleNotFoundError: No module named 'toml'" in drv_log:
             opts.append("toml")
+        if "ModuleNotFoundError: No module named 'cffi'" in drv_log:
+            opts.append("cffi")
+        if "No module named 'pybind11'" in drv_log:
+            if not "pybind11" in opts:
+                opts.append("pybind11")
+
+        if "ModuleNotFoundError: No module named 'fil3s'" in drv_log:
+            opts.append("fil3s")
+        if "No matching distribution found for matplotlib" in drv_log:
+            opts.append("matplotlib")
         if (
             "ModuleNotFoundError: No module named 'Cython'" in drv_log
         ):  # if you're so old that you don't have a pyproject.toml, but non managed build requirements, you probably also want the old cython,
             opts.append("cython")
         opts = [x for x in opts if x != pkg]
 
-        if (
-            "Cython.Compiler.Errors.CompileError:" in drv_log
-            and not "cython" in opts
-            and not "cython_0" in opts
-        ):
-            opts.append("cython")
+        if not "cython" in opts and not "cython_0" in opts:
+            if (
+                "Cython.Compiler.Errors.CompileError:" in drv_log
+                or " No matching distribution found for cython" in drv_log
+            ):
+                opts.append("cython")
+            elif (
+                "error: ‘PyThreadState’ {aka ‘struct _ts’} has no member named ‘exc_traceback’; did you mean ‘curexc_traceback’?"
+                in drv_log
+            ):
+                opts.append("cython")
 
         opts = sorted(set(opts))
         if "poetry" in opts:
@@ -187,7 +221,10 @@ class BuildSystems(Rule):
 class PoetryMasonry(Rule):
     @staticmethod
     def match(drv, drv_log, opts, _rules_here):
-        return "ModuleNotFoundError: No module named 'poetry.masonry'" in drv_log
+        return (
+            "ModuleNotFoundError: No module named 'poetry.masonry'" in drv_log
+            or "BackendUnavailable: Cannot import 'poetry.masonry.api'" in drv_log
+        )
 
     @staticmethod
     def apply(opts):
@@ -203,11 +240,19 @@ class PoetryMasonry(Rule):
 class TomlRequiresPatcher(Rule):
     @staticmethod
     def match(drv, drv_log, opts, _rules_here):
-        if "Missing dependencies:" in drv_log and has_pyproject_toml(drv):
-            start = drv_log[drv_log.find("Missing dependencies:") :]
-            next_line = start[start.find("\n") + 1 :]
-            next_line = next_line[: next_line.find("\n")]
-            return [x in next_line for x in requirements_sep_chars]
+        if "Missing dependencies:" in drv_log:
+            try:
+                pyproject_toml = get_pyproject_toml(drv)
+                if "build-system" in pyproject_toml and (
+                    "requires" in pyproject_toml
+                    or "requires" in pyproject_toml["build-system"]
+                ):
+                    start = drv_log[drv_log.find("Missing dependencies:") :]
+                    next_line = start[start.find("\n") + 1 :]
+                    next_line = next_line[: next_line.find("\n")]
+                    return [x in next_line for x in requirements_sep_chars]
+            except KeyError:
+                pass
 
     @staticmethod
     def apply(opts):
@@ -247,7 +292,10 @@ class NativeBuildInputs(Rule):
             ("Did not find pkg-config", "pkg-config"),
             ("pkgconfig", "pkg-config"),
             ("pkg-config not found", "pkg-config"),
+            ("'pkg-config' is required", "pkg-config"),
             ("pkg-config: not found", "pkg-config"),
+            ("cannot execute pkg-config", "pkg-config"),
+            ("Install pkg-config.", "pkg-config"),
             ("missing: PKG_CONFIG_EXECUTABLE", "pkg-config"),
             ("No such file or directory: 'pkg-config'", "pkg-config"),
             (
@@ -258,6 +306,7 @@ class NativeBuildInputs(Rule):
             ("pkg-config is required for building", "pkg-config"),
             ('"pkg-config" command could not be found.', "pkg-config"),
             ("CMake must be installed to build from source.", "cmake"),
+            ("Failed to install temporary CMake", "cmake"),
             ("CMake is not installed on your system!", "cmake"),
             ("Missing CMake executable", "cmake"),
             ("Cannot find CMake executable", "cmake"),
@@ -286,6 +335,7 @@ class NativeBuildInputs(Rule):
                 "Unable to locate bz2 library needed when enabling bzip2 support",
                 ["bzip2.dev", "pkg-config"],
             ),
+            ("bzlib.h: No such file or directory", ["bzip2.dev", "pkg-config"]),
             ("gmp.h: No such file or directory", ["pkg-config", "gmp.dev"]),
             ("ModuleNotFoundError: No module named 'pip'", "final.pip"),
             ("Could not run curl-config", "curl"),
@@ -327,6 +377,29 @@ class NativeBuildInputs(Rule):
             ("mpfr.h: No such file", "mpfr"),
             ("fplll/fplll_config.h: No such file", "fplll_20160331"),
             ("OSError: mariadb_config not found.", "libmysqlclient"),
+            ("mpi.h: No such file", "mpi"),
+            ("autoreconf: not found", "autoconf"),
+            ('Can\'t exec "aclocal"', "automake"),
+            ("Libtool library used but 'LIBTOOL'", "libtool"),
+            ("glpk.h: No such file", "glpk"),
+            ("could not start gsl-config", "gsl.dev"),
+            ("openssl/ssl.h: No such file", "openssl"),
+            (
+                "sqlite3.h: No such file",
+                "sqlite",
+            ),
+            ("winscard.h: No such file", "pcsclite"),
+            ("hunspell.hxx: No such file", "hunspell.dev"),
+            ("re2/re2.h: No such file", "re2"),
+            ("Eigen/Core: No such file", "eigen"),
+            ("No package 'ddjvuapi' found", "djvulibre"),
+            ("libmilter/mfapi.h: No such file", "libmilter"),
+            # ("libxml/xpath.h: No such file or directory", "libxml2"),
+            # (
+            #     "-lldap_r: No such file",
+            #     ["pkgs.openldap.dev", "pkg-config", "cyrus_sasl"],
+            # ),
+            # ("Installing this module requires OpenSSL python bindings", "final.pyopenssl"),
             # (
             #     re.compile(
             #         "do not know how to unpack source archive [^.]+.zip",
@@ -397,8 +470,13 @@ class BuildInputs(Rule):
             ("libcublas.so.11 -> not found!", "cudaPackages_11.libcublas"),
             ("libcusparse.so.12 -> not found!", "cudaPackages.libcusparse"),
             ("libcusparse.so.11 -> not found!", "cudaPackages_11.libcusparse"),
-            ("libcusolver.so.11 -> not found", "cudaPackages_11.libcusolver"),
-            ("libcudart.so.12 -> not found", "cudaPackages.cuda_cudart"),
+            ("libcusolver.so.11 -> not found!", "cudaPackages.libcusolver"),
+            (
+                "libcudart.so.12 -> not found",
+                nix_literal(
+                    '] ++ (pkgs.lib.optionals ((builtins.trace pkgs.stdenv.hostPlatform.system pkgs.stdenv.hostPlatform.system) == "x86_64-linux") [ pkgs.cudaPackages.cuda_cudart ]) ++ ['  # what an ugly hack ^^
+                ),
+            ),
             ("libcudart.so.11.0 -> not found", "cudaPackages_11.cuda_cudart"),
             ("libnvrtc.so.12 -> not found!", "cudaPackages.cuda_nvrtc"),
             ("libcupti.so.12 -> not found!", "cudaPackages.cuda_cupti"),
@@ -478,6 +556,7 @@ class BuildInputs(Rule):
              })
              """),
             ),
+            ("Boost library location was not found!", ["boost", "pkg-config"]),
             ("libconsole_bridge.so.1.0 -> not found!", "console-bridge"),
             ("libeigenpy.so -> not found!", "final.eigenpy"),
             ("libhpp-fcl.so -> not found!", "hpp-fcl"),
@@ -494,7 +573,44 @@ class BuildInputs(Rule):
             ("crack.h: No such file", "cracklib"),
             ("libjvm.so", "openjdk"),
             ("udunits2.h: No such file", "udunits"),
+            ("libprecice not found", "precice"),
+            (
+                " cups/http.h: No such file",
+                "cups",
+            ),  # libiconv on darwin, but needs extension here.
+            ("libOpenCL.so.1 -> not found!", "ocl-icd"),
+            ("libze_loader.so.1 -> not found!", "level-zero"),
+            ("Could NOT find OpenSSL", "openssl"),
+            ("graphviz/cgraph.h: No such file", "graphviz"),
+            ("-lz: No such file", "zlib"),
+            ("libssl.so.1.1 -> not found!", "openssl_1_1"),
+            ("libcrypto.so.1.1 -> not found!", "openssl_1_1"),
+            ("libz.so.1 -> not found!", "zlib"),
+            ("libkeyutils.so.1", "keyutils"),
+            ("sasl/sasl.h: No such file", "cyrus_sasl"),
+            ("Installing gifsicle on Linux requires sudo!", "gifsicle"),
+            ("could not start gsl-config", "gsl"),
+            ("libhwloc.so.15 -> not found!", "hwloc"),
             # (" RequiredDependencyException: pangocairo", "pango"),
+            ("libexiv2.so.28 -> not found!", "exiv2"),
+            ("libpcsclite.so.1 -> not found", "pcsclite"),
+            ("libcurl.so.4 -> not found!", "curl"),
+            ("libssl.so.3 -> not found!", "openssl"),
+            (
+                "libgfortran.so.5 -> not found!",
+                [
+                    nix_literal("pkgs.gfortran13.cc"),
+                    nix_literal("pkgs.gfortran13.out"),
+                ],
+            ),
+            ("cannot find -lhunspell", "pkgs.hunspell.out"),
+            ("Failed to find Gammu!", "gammu"),
+            ("libXcursor.so.1 -> not found!", "pkgs.xorg.libXcursor"),
+            ("libXfixes.so.3 -> not found!", "pkgs.xorg.libXfixes"),
+            ("libXft.so.2 -> not found!", "pkgs.xorg.libXft"),
+            ("libfontconfig.so.1 -> not found!", "pkgs.fontconfig"),
+            ("libXinerama.so.1 -> not found!", "pkgs.xorg.libXinerama"),
+            # libcrypto.so.3 -> not found!"
         ]:
             if k in drv_log:
                 if isinstance(pkgs, str):
@@ -726,7 +842,7 @@ class RefindBuildDirectory(Rule):
                 "preBuild": """
                 cd /build
                 # find the first directory containing either pyproject.toml or setup.py
-                buildDir=$(find . -maxdepth 1 -type d -exec test -e "{}/pyproject.toml" -o -e "{}/setup.py" \; -print -quit)
+                buildDir=$(find . -maxdepth 1 -type d -exec test -e "{}/pyproject.toml" -o -e "{}/setup.py" \\; -print -quit)
                 cd $buildDir
                 """
             },  # will fail if there's multiple directories
@@ -761,6 +877,16 @@ class DowngradeNumpy(Rule):
             return "<2"
         elif "No module named 'numpy.distutils'" in drv_log:
             return "<1.22"
+        elif " double I = intensity(" in drv_log:
+            return "<1.22"
+        elif " numpy/arrayobject.h: No such file" in drv_log:
+            return "<1.22"
+        elif (
+            "struct _PyArray_Descr" in drv_log
+            and "has no member named" in drv_log
+            and "subarray" in drv_log
+        ):
+            return "<2"  # https://github.com/piskvorky/gensim/issues/3541
 
         # or ("numpy/arrayobject.h: No such file" in drv_log)
 
@@ -774,10 +900,12 @@ class DowngradeNumpy(Rule):
 class DowngradePython(Rule):
     """Downgrade python if necessary"""
 
+    # always_reapply = True  # otherwise we don't apply it if we already had the rule.
+
     @staticmethod
     def match(drv, drv_log, opts, _rules_here):
         if "3.12" in drv_log and "No module named 'distutils'" in drv_log:
-            return "3.11"
+            return "3.10"
         if "greenlet-1.1.0" in drv_log:
             return "3.10"
         if (
@@ -798,12 +926,30 @@ class DowngradePython(Rule):
             return "3.9"
         if "Cannot install on Python version 3.10." in drv_log:
             return "3.9"
+        if (
+            "Cannot install on Python version " in drv_log
+            and "only versions >=3.8,<3.12" in drv_log
+        ):
+            return "3.11"
         if "pygame" in drv:
             pkg_tuple = drv_to_pkg_and_version(drv)
             version = pkg_tuple[1]
             if Version(version) <= Version("2.5.2"):
                 return "3.11"
         if "cannot import name 'build_py_2to3' from 'distutils" in drv_log:
+            return "3.9"
+        if "ModuleNotFoundError: No module named 'distutils.msvccompiler'" in drv_log:
+            return "3.9"  # old scipy
+        if "requires python >= 3.6 and <=3.10" in drv_log:
+            return "3.9"
+        if "eval.h: No such file":
+            return "3.10"
+        if (
+            "invalid literal for int() with base 10:" in drv_log
+            and "in python_version" in drv_log
+        ):  # pmisc - but get's excluded by 'max python = 3.8' anyway.
+            return "3.9"
+        if "ModuleNotFoundError: No module named 'symbol'" in drv_log:
             return "3.9"
 
     @staticmethod
@@ -834,6 +980,28 @@ class IsPython2Only(Rule):
             )
         if "except OSError, e:" in drv_log:
             return f"Is_python2_only (except OSError, e): {drv_to_pkg_and_version(drv)}"
+        if "print '" in drv_log or 'print "' in drv_log:
+            return f"Is_python2_only (print '): {drv_to_pkg_and_version(drv)}"
+        if re.search("except [^,]+,[^:]+:", drv_log):
+            return f"Is_python2_only (except x, y:): {drv_to_pkg_and_version(drv)}"
+        if "raise exc, " in drv_log or "raise my_exception, " in drv_log:
+            return f"Is_python2_only (raise exec,): {drv_to_pkg_and_version(drv)}"
+        if "cannot import name 'quote' from 'urllib'" in drv_log:
+            return f"Is_python2_only (looks for urllib.quote): {drv_to_pkg_and_version(drv)}"
+        if "SyntaxError: invalid hexadecimal literal" in drv_log and "0xFFFFFFFAL":
+            return f"Is_python2_only (long int, 0xFFFFFFFAL): {drv_to_pkg_and_version(drv)}"
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutputTriggerExclusion(opts)
+
+
+class PyPIStub(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        if "wrong pypi" in drv_log:
+            pkg_tuple = drv_to_pkg_and_version(drv)
+            return f"Not actually on pypi/stub only: {pkg_tuple}"
 
     @staticmethod
     def apply(opts):
@@ -859,7 +1027,7 @@ class Rust(Rule):
         # todo: discern maturin & setuptoolsRust
         if needed_patch:
             return RuleFunctionOutput("""
-              pkgs.lib.optionalAttrs (old.format or "sdist" != "wheel") (
+              pkgs.lib.optionalAttrs (old.passthru.format or "sdist" != "wheel") (
               helpers.standardMaturin {
               furtherArgs = {
                   postPatch = ''
@@ -871,7 +1039,7 @@ class Rust(Rule):
 
         else:
             return RuleFunctionOutput("""
-                                  pkgs.lib.optionalAttrs (old.format or "sdist" != "wheel") (helpers.standardMaturin {} old)
+                                  pkgs.lib.optionalAttrs (old.passthru.format or "sdist" != "wheel") (helpers.standardMaturin {} old)
                                   """)
 
     @staticmethod
@@ -903,7 +1071,7 @@ class Rust(Rule):
             key=lambda x: len(str(x))
         )  # shortest path first, just like search_and_extract_from_archive
         cargo_toml = cargo_tomls[0]
-        subprocess.check_call(
+        p = subprocess.Popen(
             [
                 "nix",
                 "shell",
@@ -913,7 +1081,12 @@ class Rust(Rule):
                 "check",
             ],
             cwd=cargo_toml.parent,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
+        stdout, stderr = p.communicate()
+        if p.returncode != 0:
+             raise ValueError(f"cargo check failed: {stderr.decode('utf-8')}")
         return (cargo_toml.with_name("Cargo.lock")).read_text()
 
 
@@ -980,7 +1153,12 @@ class PythonTooNew(Rule):
             return f"distutils.util has no run_2to3: {pkg_tuple}"
         if "setup command: use_2to3 is invalid." in drv_log:
             pkg_tuple = drv_to_pkg_and_version(drv)
-            return "setuptools too new, setup command: use_2to3 is invalid. {pkg_tuple}"
+            return (
+                f"setuptools too new, setup command: use_2to3 is invalid. {pkg_tuple}"
+            )
+        if "AttributeError: module 'platform' has no attribute 'dist'" in drv_log:
+            pkg_tuple = drv_to_pkg_and_version(drv)
+            return "AttributeError: module 'platform' has no attribute 'dist'"
 
     @staticmethod
     def apply(opts):
@@ -1029,7 +1207,7 @@ class MissingSetParts:
         if re.search("attribute '[^']+' missing", drv_log):
             log.warn("Missing attribute in derivation - trying to patch it in")
             # I am looking for final.something where in the next line there's a ^ pointing at it.
-            for hit in re.finditer("final\.[a-z0-9A-Z-]+", drv_log):
+            for hit in re.finditer("final\\.[a-z0-9A-Z-]+", drv_log):
                 log.debug(f"Found a hit {hit}")
                 last_newline = max(0, drv_log.rfind("\n", 0, hit.span()[0]) + 1)
                 next_newline = drv_log.find("\n", hit.span()[1])
@@ -1084,5 +1262,73 @@ class Udunits(Rule):
                 "env": {
                     "UDUNITS2_XML_PATH": "${pkgs.udunits}/share/udunits/udunits2.xml"
                 },
+            },
+        )
+
+
+class HomlessShelter(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        return "Permission denied: '/homeless-shelter'" in drv_log
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutput(
+            src_attrset_parts={
+                "env": {"HOME": "/tmp"},
+            },
+        )
+
+
+class NvidiaCollision(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        pkg, version = drv_to_pkg_and_version(drv)
+        return pkg.startswith("nvidia-cu")
+        # leads to
+        # Target: /nix/store/dlmjc4l64spkfy4dg4sj7zli0k2rdix7-test-venv/lib/python3.12/site-packages/nvidia/__pycache__/__init__.cpython-312.opt-2.pyc
+
+    # >      File 1: /nix/store/rs7214axar5xx0v2xl1y0axic8k4mm3n-nvidia-nccl-cu12-2.20.5/lib/python3.12/site-packages/nvidia/__pycache__/__init__.cpython-312.opt-2.pyc
+    # >      File 2: /nix/store/xpjpqyb5n4l6gaqxys6cgi4fdisflcf3-nvidia-cusparse-cu12-12.1.0.106/lib/python3.12/site-packages/nvidia/__pycache__/__init__.cpython-312.opt-2.pyc.
+    # in a lot of nvidia-cu* packages other wise
+    # and since that is only happening when the venv is being build
+    # it's hard to backtraco to the offending derivation.
+    # so we just name match here.
+    # if re.search("Target: /nix/store/[^/]+/lib/python[^/]+/site-packages/nvidia/__pycache__/__init__.cpython-[^.]+\\.opt-2\\.pyc", drv_log):
+    #     lines = drv_log.split("\n")
+    #     pkg1 = extract_from_line([x for x in lines if 'File 1:' in x][0])
+    #     pkg2 = extract_from_line([x for x in lines if 'File 2:' in x][0])
+    #     return (pkg1, pkg2)
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutput(
+            src_attrset_parts={
+                "env": {"dontUsePyprojectBytecode": true},
+            },
+        )
+
+
+class HD5DIR(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        return (
+            "You may need to explicitly state where your local HDF5 headers" in drv_log
+        )
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutput(
+            arguments=["pkgs"],
+            src_attrset_parts={
+                "env": {
+                    "HDF5_DIR": nix_literal("pkgs.lib.getDev pkgs.hdf5"),
+                },
+                "nativeBuildInputs": [
+                    nix_literal("pkgs.pkg-config"),
+                    nix_literal("pkgs.hdf5"),
+                    nix_literal("final.blosc2"),
+                ],
+                "buildInputs": [nix_literal("pkgs.c-blosc2")],
             },
         )
