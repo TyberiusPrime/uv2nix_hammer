@@ -29,8 +29,8 @@ def drv_to_pkg_and_version(drv):
     return pkg_tuple
 
 
-def extract_pyproject_toml_from_archive(src_path):
-    return toml.loads(search_and_extract_from_archive(src_path, "pyproject.toml"))
+def extract_pyproject_toml_from_archive(src_path, forbidden_paths=None):
+    return toml.loads(search_and_extract_from_archive(src_path, "pyproject.toml", forbidden_paths))
 
 
 def search_in_archive(src_path, filename):
@@ -57,7 +57,7 @@ def search_in_archive(src_path, filename):
     else:
         raise ValueError("not an archive")
 
-def search_and_extract_from_archive(src_path, filename):
+def search_and_extract_from_archive(src_path, filename, forbidden_paths=None):
     """Read a file from archive and return it's contents.
 
     Searchs for the file in arbitrary sub folders,
@@ -68,7 +68,10 @@ def search_and_extract_from_archive(src_path, filename):
         candidates = []
         for fn in tf.getnames():
             if fn.endswith(filename):
-                candidates.append(fn)
+                if (not forbidden_paths or not any(
+                    [x in str(fn) for x in forbidden_paths]
+                )):
+                    candidates.append(fn)
         candidates.sort(key=lambda x: len(x))
         if not candidates:
             raise KeyError(f"no {filename}")
@@ -95,10 +98,10 @@ def has_pyproject_toml(drv):
     except:
         return False
 
-def get_pyproject_toml(drv):
+def get_pyproject_toml(drv, forbidden_paths=None):
     src = get_src(drv)
     try:
-        return extract_pyproject_toml_from_archive(src)
+        return extract_pyproject_toml_from_archive(src, forbidden_paths)
     except:
         raise KeyError("no pyproject.toml")
 

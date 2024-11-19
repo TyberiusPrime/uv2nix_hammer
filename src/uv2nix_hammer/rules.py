@@ -110,7 +110,9 @@ class BuildSystems(Rule):
                 opts.append("pycodestyle")
             if "isort" in lines:
                 opts.append("isort")
-            if "cython>=3" in from_here:
+            if "Cython<3,>=0.29.22" in from_here or "cython<=3" in from_here:
+                opts.append("cython_0")
+            elif "cython>=3" in from_here:
                 opts.append("cython")
             elif (
                 "cython" in lines
@@ -146,6 +148,18 @@ class BuildSystems(Rule):
                 opts.append("certifi")
             if "versiontools>" in from_here:
                 opts.append("versiontools")
+            if "fastrlock" in from_here:
+                opts.append("fastrlock")
+            if "vcversioner" in from_here:
+                opts.append("vcversioner")
+            if "flake8" in lines:
+                opts.append("flake8")
+            if "versioneer" in lines:
+                opts.append("versioneer")
+            if "pytest-benchmark" in lines:
+                opts.append("pytest-benchmark")
+            if "sphinx" in lines:
+                opts.append("sphinx")
         if "cppyy-cling" in drv_log:
             opts.append("cppyy-cling")
         if "cppyy-backend" in drv_log:
@@ -249,7 +263,9 @@ class TomlRequiresPatcher(Rule):
     def match(drv, drv_log, opts, _rules_here):
         if "Missing dependencies:" in drv_log:
             try:
-                pyproject_toml = get_pyproject_toml(drv)
+                pyproject_toml = get_pyproject_toml(
+                    drv, forbidden_paths=["third_party"]
+                )
                 if "build-system" in pyproject_toml and (
                     "requires" in pyproject_toml
                     or "requires" in pyproject_toml["build-system"]
@@ -294,6 +310,10 @@ class NativeBuildInputs(Rule):
 
         for q, vs in [
             ("No such file or directory: 'gfortran'", "gfortran"),
+            (
+                "configure: error: No fortran compiler found, please set the FC flag",
+                "gfortran",
+            ),
             ("but no Fortran compiler found", "gfortran"),
             ("No CMAKE_Fortran_COMPILER could be found.", "gfortran"),
             ("Did not find pkg-config", "pkg-config"),
@@ -313,6 +333,8 @@ class NativeBuildInputs(Rule):
             ("pkg-config is required for building", "pkg-config"),
             ('"pkg-config" command could not be found.', "pkg-config"),
             ("CMake must be installed to build from source.", "cmake"),
+            ("Did not find CMake 'cmake'", "cmake"),
+            ("need to install CMake", "cmake"),
             ("Failed to install temporary CMake", "cmake"),
             ("CMake is not installed on your system!", "cmake"),
             ("Missing CMake executable", "cmake"),
@@ -393,6 +415,7 @@ class NativeBuildInputs(Rule):
             ("glpk.h: No such file", "glpk"),
             ("could not start gsl-config", "gsl.dev"),
             ("openssl/ssl.h: No such file", "openssl"),
+            (" openssl/aes.h: No such file", "openssl"),
             (
                 "sqlite3.h: No such file",
                 "sqlite",
@@ -405,6 +428,16 @@ class NativeBuildInputs(Rule):
             ("libmilter/mfapi.h: No such file", "libmilter"),
             ("Error: pg_config executable not found.", "postgresql.dev"),
             ("cudaProfiler.h: No such", "cudaPackages.cuda_profiler_api"),
+            ("curand.h: No such file", "cudaPackages.libcurand"),
+            ("crt/host_config.h: No such file", "cudaPackages.cuda_nvcc"),
+            ("exiv2/exiv2.hpp: No such fil", "exiv2"),
+            (
+                "boost/python.hpp: No such file",
+                "(pkgs.boost.override {python = final.python; numpy=final.numpy; enablePython=true;})",
+            ),
+            ("libxml/xmlreader.h: No such file or directory", "libxml2.dev"),
+            ("Could NOT find ZLIB", "pkgs.zlib.dev"),
+            # (" Unable to find the blosc2 library.", "c-blosc2"),
             # ("libxml/xpath.h: No such file or directory", "libxml2"),
             # (
             #     "-lldap_r: No such file",
@@ -622,7 +655,18 @@ class BuildInputs(Rule):
             ("libfontconfig.so.1 -> not found!", "pkgs.fontconfig"),
             ("libXinerama.so.1 -> not found!", "pkgs.xorg.libXinerama"),
             ("libkrb5.so.3 -> not found!", "krb5"),
-            # libcrypto.so.3 -> not found!"
+            ("Could NOT find BLAS", ["blas", "lapack"]),
+            ("openblas", ["openblas", "pkg-config"]),
+            ("umfpack", ["suitesparse"]),
+            ("pull submodule rabbitmq-c.", "rabbitmq-c"),
+            ("libdbus-1.so.3 -> not found!", "dbus"),
+            ("libusb-1.0.so.0 -> not found!", "libusb1"),
+            ("libbluetooth.so.3 -> not found!", "bluez"),
+            ("libgtk-x11-2.0.so.0", ["gtk2", "pkg-config"]),
+            ("libcairo.so.2 -> not found!", "cairo"),
+            ("libpango-1.0.so.0 -> not found!", "pango"),
+            ("mysql_config not found", "libmysqlclient"),
+            ("libnl-3.so.200 -> not found!", "libnl"),
         ]:
             if k in drv_log:
                 if isinstance(pkgs, str):
@@ -864,7 +908,10 @@ class RefindBuildDirectory(Rule):
 class Torch(Rule):
     @staticmethod
     def match(drv, drv_log, opts, _rules_here):
-        return "libc10_cuda.so -> not found!" in drv_log
+        return (
+            "libc10_cuda.so -> not found!" in drv_log
+            or "libtorch.so -> not found!" in drv_log
+        )
 
     @staticmethod
     def apply(opts):
@@ -891,7 +938,18 @@ class DowngradeSetupTools(Rule):
 
     @staticmethod
     def apply(opts):
-        return RuleOutput(dep_constraints={"numpy": opts})
+        return RuleOutput(dep_constraints={"setuptools": opts})
+
+
+class DowngradePytestRunner(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        if "pytest-runner<5.0" in drv_log:
+            return "<5.0"
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutput(dep_constraints={"pytest-runner": opts})
 
 
 class DowngradeNumpy(Rule):
@@ -916,6 +974,17 @@ class DowngradeNumpy(Rule):
         elif (
             'origin = find_spec("numpy").origin' in drv_log
             and "AttributeError: 'NoneType' object has no attribute 'origin" in drv_log
+        ):
+            return "<2"
+        elif (
+            "error: request for member ‘imag’ in something not a structure or union"
+            in drv_log
+        ):
+            return "<2"
+        elif (
+            "_PyArray_Descr" in drv_log
+            and " has no member named" in drv_log
+            and "names" in drv_log
         ):
             return "<2"
 
@@ -981,6 +1050,12 @@ class DowngradePython(Rule):
         if "eval.h: No such file" in drv_log:
             log.error("Downgrading Python - eval.h")
             return "3.10"
+        if "_PyUnicode_get_wstr_length(PyObject *op)" in drv_log:
+            log.error("Downgrading Python - _PyUnicode_get_wstr_length")
+            return "3.9"
+        if "PyArray_Descr’} has no member named ‘subarray’" in drv_log:
+            log.error("Downgrading Python - PyArray_Descr")
+            return "3.10"
         if (
             "invalid literal for int() with base 10:" in drv_log
             and "in python_version" in drv_log
@@ -988,10 +1063,16 @@ class DowngradePython(Rule):
             return "3.9"
         if "ModuleNotFoundError: No module named 'symbol'" in drv_log:
             return "3.9"
+        if (
+            "‘PyLongObject’ {aka ‘struct _longobject’} has no member named ‘ob_digit’"
+            in drv_log
+        ):
+            log.error("Downgrading Python - ob_digit")
+            return "3.11"
 
     @staticmethod
     def apply(opts):
-        log.debug(f"Downgrading to python {opts}")
+        # log.debug(f"Downgrading to python {opts}")
         return RuleOutput(python_downgrade=opts)
 
 
@@ -1021,7 +1102,12 @@ class IsPython2Only(Rule):
             return f"Is_python2_only (print '): {drv_to_pkg_and_version(drv)}"
         if re.search("except [^,]+,[^:]+:", drv_log):
             return f"Is_python2_only (except x, y:): {drv_to_pkg_and_version(drv)}"
-        if "raise exc, " in drv_log or "raise my_exception, " in drv_log:
+        # todo: this needs a regexp
+        if (
+            "raise exc, " in drv_log
+            or "raise my_exception, " in drv_log
+            or "raise newexc, None, sys.exc_info()" in drv_log
+        ):
             return f"Is_python2_only (raise exec,): {drv_to_pkg_and_version(drv)}"
         if "cannot import name 'quote' from 'urllib'" in drv_log:
             return f"Is_python2_only (looks for urllib.quote): {drv_to_pkg_and_version(drv)}"
@@ -1059,12 +1145,15 @@ class Rust(Rule):
 
     @staticmethod
     def apply(opts):
-        opts, extract_result = opts
+        try:
+            opts, extract_result = opts
+        except:
+            extract_result = False
         needed_patch = extract_result
         # todo: discern maturin & setuptoolsRust
         if needed_patch:
             return RuleFunctionOutput("""
-              pkgs.lib.optionalAttrs (old.passthru.format or "sdist" != "wheel") (
+              pkgs.lib.optionalAttrs (!helpers.isWheel old) (
               helpers.standardMaturin {
               furtherArgs = {
                   postPatch = ''
@@ -1076,7 +1165,7 @@ class Rust(Rule):
 
         else:
             return RuleFunctionOutput("""
-                                  pkgs.lib.optionalAttrs (old.passthru.format or "sdist" != "wheel") (helpers.standardMaturin {} old)
+                                  pkgs.lib.optionalAttrs (!helpers.isWheel old) (helpers.standardMaturin {} old)
                                   """)
 
     @staticmethod
@@ -1341,7 +1430,7 @@ class NvidiaCollision(Rule):
     def apply(opts):
         return RuleOutput(
             src_attrset_parts={
-                "env": {"dontUsePyprojectBytecode": true},
+                "env": {"dontUsePyprojectBytecode": True},
             },
         )
 
@@ -1367,5 +1456,23 @@ class HD5DIR(Rule):
                     nix_literal("final.blosc2"),
                 ],
                 "buildInputs": [nix_literal("pkgs.c-blosc2")],
+            },
+        )
+
+
+class UnpackerNoDirectories(Rule):
+    @staticmethod
+    def match(drv, drv_log, opts, _rules_here):
+        return "unpacker appears to have produced no directories" in drv_log
+
+    @staticmethod
+    def apply(opts):
+        return RuleOutput(
+            src_attrset_parts={
+                "unpackPhase": nix_literal("""''
+                mkdir src/${old.pname}/${old.version} -p
+                cd src/${old.pname}/${old.version} 
+                unzip $src
+                ''""")
             },
         )

@@ -269,7 +269,22 @@ def attempt_build(project_folder, attempt_no):
         raise AddDependency({"versioneer-518": ">0"})
     if "attribute 'certifi' missing" in stderr:
         raise AddDependency({"certifi": ">0"})
-
+    if "attribute 'vcversioner' missing" in stderr:
+        raise AddDependency({"vcversioner": ">0"})
+    if "attribute 'flake8' missing" in stderr:
+        raise AddDependency({"flake8": ">0"})
+    if "attribute 'extension-helpers' missing" in stderr:
+        raise AddDependency({"extension-helpers": ">0"})
+    if "attribute 'isort' missing" in stderr:
+        raise AddDependency({"isort": ">0"})
+    if "attribute 'pycodestyle' missing" in stderr:
+        raise AddDependency({"pycodestyle": ">0"})
+    if "attribute 'pytest-benchmark' missing" in stderr:
+        raise AddDependency({"pytest-benchmark": ">0"})
+    if "attribute 'sphinx' missing" in stderr:
+        raise AddDependency({"sphinx": ">0"})
+    if "attribute 'pyyaml' missing" in stderr:
+        raise AddDependency({"pyyaml": ">0"})
     if "while evaluating the attribute" in stderr:
         raise ValueError(
             "Generated overwrites were not valid nix code (syntax or semantic)"
@@ -381,6 +396,9 @@ def write_combined_rules(path, rules_to_combine, project_folder, do_format=False
                 pkg_build_systems.update(rule_output.build_systems)
             function_arguments.update(rule_output.arguments)
 
+            if rule_output.src_attrset_parts or rule_output.wheel_attrset_parts:
+                function_arguments.add("helpers")
+
             for src, dest in (
                 (rule_output.src_attrset_parts, src_attrset_parts),
                 (rule_output.wheel_attrset_parts, wheel_attrset_parts),
@@ -402,9 +420,9 @@ def write_combined_rules(path, rules_to_combine, project_folder, do_format=False
                             f"Think up a merge strategy for {k} {repr(dest[k])} vs {repr(v)}"
                         )
             if rule_output.requires_nixpkgs_master:
-                log.debug(
-                    f"Enabled nixpkgs master because of rule {rule_name} - {path}"
-                )
+                # log.debug(
+                #     f"Enabled nixpkgs master because of rule {rule_name} - {path}"
+                # )
                 requires_nixpkgs_master = True
             if rule_output.dep_constraints:
                 for k, v in rule_output.dep_constraints.items():
@@ -425,6 +443,7 @@ def write_combined_rules(path, rules_to_combine, project_folder, do_format=False
 
     if pkg_build_systems:
         function_arguments.add("final")
+        function_arguments.add("helpers")
         function_arguments.add("resolveBuildSystem")
 
     pkg_build_systems = {x: [] for x in pkg_build_systems}
@@ -479,7 +498,7 @@ def write_combined_rules(path, rules_to_combine, project_folder, do_format=False
 
         else:
             funcs.append(
-                f"""old: if ((old.passthru.format or "sdist") == "wheel") then {wheel_body} else {src_body}"""
+                f"""old: if (helpers.isWheel old) then {wheel_body} else {src_body}"""
             )
     funcs.extend(further_funcs)
     if len(funcs) == 1:
@@ -508,7 +527,7 @@ def write_combined_rules(path, rules_to_combine, project_folder, do_format=False
         out_body
     ):  # no need to write a default.nix if all we did was downgrade pytohn or such
         if function_arguments:
-            head = f"{{{", ".join(function_arguments)}, ...}}"
+            head = f"{{{", ".join(sorted(function_arguments))}, ...}}"
         else:
             head = "{...}"
 
@@ -609,8 +628,7 @@ def detect_rules(project_folder, overrides_folder, failures, current_python):
                     rules_here[rule_name] = opts
                     if (
                         (opts != old_opts)
-                        or (opts
-                        and hasattr(rule, "always_reapply"))
+                        or (opts and hasattr(rule, "always_reapply"))
                         or (
                             isinstance(rule, type)
                             and issubclass(rule, rules.DowngradePython)
@@ -821,9 +839,9 @@ def apply_all_manual_overrides(overrides_folder):
             rules_so_far = load_existing_rules(overrides_folder, pkg, version)
             rules_so_far["ManualOverrides"] = f"__file__:{pkg}/{version}/default.nix"
             target_path = overrides_folder / "overrides" / pkg / version / "default.nix"
-            log.debug(
-                f"Preloading manual overrides for {pkg}=={version} into {target_path}"
-            )
+            # log.debug(
+            #     f"Preloading manual overrides for {pkg}=={version} into {target_path}"
+            # )
             target_path.parent.mkdir(exist_ok=True, parents=True)
             write_combined_rules(target_path, rules_so_far, None)
             toml.dump(rules_so_far, open(target_path.with_name("rules.toml"), "w"))
@@ -853,7 +871,12 @@ def main():
             # raise ValueError("non-rewrite needs target_pkg")
             get_parser().print_help()
             sys.exit(1)
-        target_pkg_version = args.target_pkg_version
+        if target_pkg.startswith("hammer_build"):  # so I can autocomplete on the shell
+            if target_pkg.endswith("/"):
+                target_pkg = target_pkg[:-1]
+            _, _, target_pkg, target_pkg_version = target_pkg.split("_")
+        else:
+            target_pkg_version = args.target_pkg_version
         target_pkg, target_pkg_version, had_src = verify_target_on_pypi(
             target_pkg, target_pkg_version, cache_folder
         )
@@ -939,7 +962,7 @@ def main():
             sdist_or_wheel,
             python_version,
         )
-        #if not (project_folder / "uv.lock").exists():
+        # if not (project_folder / "uv.lock").exists():
         uv_lock(project_folder)
         # if not (project_folder / "flake.nix").exists():
         write_flake_nix(project_folder, uv2nix, overrides_folder, python_version)
@@ -990,10 +1013,11 @@ def main():
                     else:
                         raise
                 except AddDependency as e:
-                    log.warn("Adding dep from AddDependency")
+                    log.warn(f"Adding dep from AddDependency {e}")
                     extend_pyproject_toml_with_dep_constraints(
                         e.deps, project_folder / "pyproject.toml"
                     )
+                    attempt_no += 1
                     continue
                 except ValueError:
                     console.print_exception(show_locals=True)
@@ -1133,4 +1157,4 @@ def main_rewrite_all():
                 rules_here = load_existing_rules(target_folder, pkg, version)
             except toml.TomlDecodeError:
                 print(rules_here)
-            write_combined_rules(path.with_name("default.nix"), rules_here, None)
+            write_combined_rules(version_folder / "default.nix", rules_here, None)
