@@ -9,11 +9,19 @@
     pyproject-nix.url = "{pyproject_nix_repo}";
     pyproject-nix.inputs.nixpkgs.follows = "nixpkgs";
     uv2nix.inputs.pyproject-nix.follows = "pyproject-nix";
+    pyproject-build-systems = {
+      url = "github:pyproject-nix/build-system-pkgs";
+      inputs.pyproject-nix.follows = "pyproject-nix";
+      inputs.uv2nix.follows = "uv2nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
   outputs = {
     nixpkgs,
     uv2nix,
     uv2nix_hammer_overrides,
+        pyproject-build-systems,
+
     #pyproject-nix,
     ...
   }: let
@@ -33,7 +41,11 @@
       overlay = workspace.mkPyprojectOverlay {
         sourcePreference = "wheel";
       };
-      pyprojectOverrides = uv2nix_hammer_overrides.overrides_strict pkgs;
+      pyprojectOverrides = lib.composeManyExtensions [
+        pyproject-build-systems.overlays.default
+        (uv2nix_hammer_overrides.overrides_strict pkgs)
+      ];
+
       #pyprojectOverrides = final: prev: {};
       interpreter = pkgs.python{flatpythonver};
       spec = {
