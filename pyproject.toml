@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "networkx>=3.3",
     "packaging>=24.1",
-    "rich>=13.8.0",
+    "rich>=13.7.0",
     "toml>=0.10.2",
     "urllib3",
 ]

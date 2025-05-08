@@ -2,3 +2,4 @@ temp/
 hammer_build*
 __pycache__/
 .uv2nix_hammer_cache/
+result

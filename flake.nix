@@ -18,5 +18,16 @@
       pkgs.mkShell {
         buildInputs = [pkgs.uv pkgs.rsync (pkgs.python312.withPackages (p: [p.rich p.packaging p.toml p.urllib3]))];
       });
+    packages = eachSystem (
+      pkgs: {
+        default = pkgs.python312Packages.buildPythonPackage {
+          name = "uv2nix_hammer";
+          format = "pyproject";
+          src = ./.;
+            nativeBuildInputs = [pkgs.python312Packages.hatchling];
+          propagatedBuildInputs = with pkgs.python312Packages; [rich packaging toml urllib3 networkx];
+        };
+      }
+    );
   };
 }
