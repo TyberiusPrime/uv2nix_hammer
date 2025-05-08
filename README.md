@@ -13,7 +13,7 @@ This tool does so for arbitrary pypi packages.
 
 Usage:
 ```
-uv2nix_hammer <package-name> [version]
+nix run github:TyberiusPrime/uv2nix_hammer <package-name> [version]
 ```
 
 What it does:
@@ -24,7 +24,7 @@ and attempt to build it using freshly cloned overrides from the
 uv2nix_hammer_overrides repository. (in
 'hammer_build_<package-name>-version/overrides').
 
-If successfull, you'll end up with a PR ready branch in 'hammer_build_<package-name>-version/overrides' 
+If successful, you'll end up with a PR ready branch in 'hammer_build_<package-name>-version/overrides' 
 that you can use to contribute the overrides back to the [uv2nix_hammer_overrides repository](https://github.com/TyberiusPrime/uv2nix_hammer_overrides/)
 
 
