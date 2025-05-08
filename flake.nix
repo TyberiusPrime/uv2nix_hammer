@@ -26,7 +26,7 @@
           format = "pyproject";
           src = ./.;
           nativeBuildInputs = [pkgs.python312Packages.hatchling];
-          propagatedBuildInputs = with pkgs.python312Packages; [rich packaging toml urllib3 networkx];
+          propagatedBuildInputs = with pkgs.python312Packages; [uv rich packaging toml urllib3 networkx];
         };
       }
     );
