@@ -514,7 +514,7 @@ class BuildInputs(Rule):
             ("libcublas.so.11 -> not found!", "cudaPackages_11.libcublas"),
             ("libcusparse.so.12 -> not found!", "cudaPackages.libcusparse"),
             ("libcusparse.so.11 -> not found!", "cudaPackages_11.libcusparse"),
-            ("libcusparseLt.so.0 -> not found!", "cudaPackages.libcusparselt"),
+            ("libcusparseLt.so.0 -> not found!", "cudaPackages.cusparselt"),
             ("libcufile.so.0 -> not found!", "cudaPackages.libcufile"),
             ("libcusolver.so.11 -> not found!", "cudaPackages.libcusolver"),
             (
