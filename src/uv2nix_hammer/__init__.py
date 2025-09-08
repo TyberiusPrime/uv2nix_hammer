@@ -319,7 +319,7 @@ def get_nix_log(drv):
 def load_failures(project_folder, run_no):
     log_file = project_folder / f"run_{run_no}.log"
     raw = log_file.read_text()
-    failed_drvs = re.findall("error: builder for '(/nix/store/[^']+)' failed", raw)
+    failed_drvs = re.findall("error: (?:builder for|Cannot build) '(/nix/store/[^']+)'(?:\\.| failed)", raw)
     return {drv: get_nix_log(drv) for drv in failed_drvs if not "test-venv" in drv}
 
 
