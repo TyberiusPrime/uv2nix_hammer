@@ -172,6 +172,8 @@ class BuildSystems(Rule):
             opts.append("numpy")
         if "ModuleNotFoundError: No module named 'pandas'" in drv_log:
             opts.append("pandas")
+        if "ModuleNotFoundError: No module named 'mesonpy'" in drv_log:
+            opts.append("meson-python")
         if "ModuleNotFoundError: No module named 'convertdate'" in drv_log:
             opts.append("convertdate")
         if "ModuleNotFoundError: No module named 'lunarcalendar'" in drv_log:
@@ -222,6 +224,8 @@ class BuildSystems(Rule):
             or "pybind11Config.cmake" in drv_log
         ):
             opts.append("pybind11")
+        if "Could not find ninja" in drv_log:
+            opts.append("ninja")
         if "No such file or directory: 'cmake'" in drv_log:
             opts.append("cmake")
         filtered_build_systems = [
