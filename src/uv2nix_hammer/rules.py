@@ -508,8 +508,8 @@ class BuildInputs(Rule):
         #     opts.append(nix_literal("pkgs.lapack"))
         for k, pkgs in [
             ("error: libhdf5.so: cannot open shared object file", "hdf5"),
-            ("libtbb.so.12 -> not found!", "pkgs.tbb_2021_11.out"),
-            ("libtbb.so.2 -> not found!", "pkgs.tbb.out"),
+            ("libtbb.so.12 -> not found!", "pkgs.onetbb.out"),
+            ("libtbb.so.2 -> not found!", "pkgs.onetbb.out"),
             ("zlib.h: No such file or directory", "pkgs.zlib.out"),
             ("No package 'libswscale' found", "ffmpeg"),
             ("libtensorflow_framework.so.2 -> not found!", "libtensorflow"),

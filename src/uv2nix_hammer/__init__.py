@@ -57,7 +57,6 @@ dependencies = [
     )
 
 
-default_nixpkgs_version = "684a8fe32d4b7973974e543eed82942d2521b738"
 
 
 def write_flake_nix(
@@ -65,7 +64,7 @@ def write_flake_nix(
     uv2nix_repo,
     hammer_overrides_folder,
     python_version,
-    nixpkgs_version=default_nixpkgs_version,  # fix for now, there's an issue building the newest uv.
+    nixpkgs_version,  # fix for now, there's an issue building the newest uv.
 ):
     log.debug(
         f"Writing flake, python_version={python_version}, nixpkgs={nixpkgs_version}"
@@ -806,6 +805,13 @@ def get_parser():
         help="Url for the flake repository with the uv2nix_hammer_overrides",
         default="https://github.com/TyberiusPrime/uv2nix_hammer_overrides",
     )
+    p.add_argument(
+        "-n",
+        "--nixpkgs_version",
+        action="store",
+        help="Nixpkgs version to use",
+        default= "684a8fe32d4b7973974e543eed82942d2521b738"
+    )
 
     return p
 
@@ -965,7 +971,9 @@ def main():
         # if not (project_folder / "uv.lock").exists():
         uv_lock(project_folder)
         # if not (project_folder / "flake.nix").exists():
-        write_flake_nix(project_folder, uv2nix, overrides_folder, python_version)
+        write_flake_nix(project_folder, uv2nix, overrides_folder, python_version,
+                        nixpkgs_version=args.nixpkgs_version
+                        )
         gitify(project_folder)
 
         remove_old_logs(project_folder)
@@ -998,7 +1006,7 @@ def main():
                         uv2nix,
                         overrides_folder,
                         python_version if not python_downgrade else python_downgrade,
-                        default_nixpkgs_version,
+                        args.nixpkgs_version,
                     )
                 try:
                     run_no = attempt_build(project_folder, attempt_no)
