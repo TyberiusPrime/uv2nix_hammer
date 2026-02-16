@@ -77,7 +77,7 @@ class BuildSystems(Rule):
                             ]
                         )
                     )
-                except KeyError:
+                except (KeyError, IndexError): # parsing failed?
                     opts = []
             except ValueError:
                 opts = []  # was a wheel
